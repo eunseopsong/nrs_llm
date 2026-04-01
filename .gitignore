@@ -1,0 +1,23 @@
+# Python virtual env
+venv/
+venv_ros_mcp/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/
+
+# Build / dist
+build/
+dist/
+
+# Env files
+.env
+.env.*
+
+# OS files
+.DS_Store

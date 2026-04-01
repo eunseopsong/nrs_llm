@@ -1,0 +1,1470 @@
+import io
+import json
+import os
+import time
+import subprocess
+import signal
+import select
+from typing import Any, Dict, List, Optional, Union
+
+from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
+from PIL import Image as PILImage
+
+from utils.config_utils import get_robot_specifications, parse_robot_config
+from utils.network_utils import ping_ip_and_port
+from utils.websocket_manager import WebSocketManager, parse_image, parse_json
+
+# ROS bridge connection settings
+ROSBRIDGE_IP = "127.0.0.1"  # Default is localhost. Replace with your local IP or set using the LLM.
+ROSBRIDGE_PORT = (
+    9090  # Rosbridge default is 9090. Replace with your rosbridge port or set using the LLM.
+)
+
+# MCP transport settings
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").lower()  # Default is stdio.
+
+# MCP connection settings (streamable-http)
+MCP_HOST = os.getenv(
+    "MCP_HOST", "127.0.0.1"
+)  # Default is localhost. Replace with the address of your remote MCP server.
+
+# MCP port settings (default=9000)
+MCP_PORT = int(
+    os.getenv("MCP_PORT", "9000")
+)  # Default is 9000. Replace with the port of your remote MCP server.
+
+# Initialize MCP server and WebSocket manager
+mcp = FastMCP("ros-mcp-server")
+ws_manager = WebSocketManager(
+    ROSBRIDGE_IP, ROSBRIDGE_PORT, default_timeout=5.0
+)  # Increased default timeout for ROS operations
+
+
+@mcp.tool(description=("Get robot configuration from YAML file."))
+def get_robot_config(name: str) -> dict:
+    """
+    Get the robot configuration from the YAML file for connecting to the robot and knowing its capabilities.
+
+    Returns:
+        dict: The robot configuration.
+    """
+    robot_config = parse_robot_config(name)
+
+    if len(robot_config) > 1:
+        return {
+            "error": f"Multiple configurations found for robot '{name}'. Please specify a more precise name."
+        }
+    elif not robot_config:
+        return {
+            "error": f"No configuration found for robot '{name}'. Please check the name and try again. Or you can set the IP/port manually using the 'connect_to_robot' tool."
+        }
+    return {"robot_config": robot_config}
+
+
+@mcp.tool(
+    description=("List all available robot specifications that can be used with get_robot_config.")
+)
+def list_verified_robot_specifications() -> dict:
+    """
+    Get a list of all available robot specification files.
+
+    Returns:
+        dict: List of available robot names that can be used with get_robot_config.
+    """
+    return get_robot_specifications()
+
+
+@mcp.tool(
+    description=(
+        "After getting the robot config, connect to the robot by setting the IP/port and testing connectivity."
+    )
+)
+def connect_to_robot(
+    ip: Optional[str] = None,
+    port: Optional[Union[int, str]] = None,
+    ping_timeout: float = 2.0,
+    port_timeout: float = 2.0,
+) -> dict:
+    """
+    Connect to a robot by setting the IP and port for the WebSocket connection, then testing connectivity.
+
+    Args:
+        ip (Optional[str]): The IP address of the rosbridge server. Defaults to "127.0.0.1" (localhost).
+        port (Optional[int]): The port number of the rosbridge server. Defaults to 9090.
+        ping_timeout (float): Timeout for ping in seconds. Default = 2.0.
+        port_timeout (float): Timeout for port check in seconds. Default = 2.0.
+
+    Returns:
+        dict: Connection status with ping and port check results.
+    """
+    # Set default values if None
+    actual_ip = ip if ip is not None else "127.0.0.1"
+    actual_port = int(port) if port is not None else 9090
+
+    # Set the IP and port
+    ws_manager.set_ip(actual_ip, actual_port)
+
+    # Test connectivity
+    ping_result = ping_ip_and_port(actual_ip, actual_port, ping_timeout, port_timeout)
+
+    # Combine the results
+    return {
+        "message": f"WebSocket IP set to {actual_ip}:{actual_port}",
+        "connectivity_test": ping_result,
+    }
+
+
+@mcp.tool(description=("Fetch available topics from the ROS bridge.\nExample:\nget_topics()"))
+def get_topics() -> dict:
+    """
+    Fetch available topics from the ROS bridge.
+
+    Returns:
+        dict: Contains two lists - 'topics' and 'types',
+            or a message string if no topics are found.
+    """
+    # rosbridge service call to get topic list
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/topics",
+        "type": "rosapi_msgs/srv/Topics",  # [ROS 2] Updated type
+        "id": "get_topics_request_1",
+    }
+
+    # Request topic list from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+
+    # Return topic info if present
+    if response and "values" in response:
+        return response["values"]
+    else:
+        return {"warning": "No topics found"}
+
+
+@mcp.tool(
+    description=("Get the message type for a specific topic.\nExample:\nget_topic_type('/cmd_vel')")
+)
+def get_topic_type(topic: str) -> dict:
+    """
+    Get the message type for a specific topic.
+
+    Args:
+        topic (str): The topic name (e.g., '/cmd_vel')
+
+    Returns:
+        dict: Contains the 'type' field with the message type,
+            or an error message if topic doesn't exist.
+    """
+    # Validate input
+    if not topic or not topic.strip():
+        return {"error": "Topic name cannot be empty"}
+
+    # rosbridge service call to get topic type
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/topic_type",
+        "type": "rosapi_msgs/srv/TopicType",  # [ROS 2] Updated type
+        "args": {"topic": topic},
+        "id": f"get_topic_type_request_{topic.replace('/', '_')}",
+    }
+
+    # Request topic type from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+
+    # Return topic type if present
+    if response and "values" in response:
+        topic_type = response["values"].get("type", "")
+        if topic_type:
+            return {"topic": topic, "type": topic_type}
+        else:
+            return {"error": f"Topic {topic} does not exist or has no type"}
+    else:
+        return {"error": f"Failed to get type for topic {topic}"}
+
+
+@mcp.tool(
+    description=(
+        "Get the complete structure/definition of a message type.\n"
+        "Example:\n"
+        "get_message_details('geometry_msgs/msg/Twist')"  # [ROS 2] Updated example
+    )
+)
+def get_message_details(message_type: str) -> dict:
+    """
+    Get the complete structure/definition of a message type.
+
+    Args:
+        message_type (str): The message type (e.g., 'geometry_msgs/msg/Twist') # [ROS 2] Updated
+
+    Returns:
+        dict: Contains the message structure with field names and types,
+            or an error message if the message type doesn't exist.
+    """
+    # Validate input
+    if not message_type or not message_type.strip():
+        return {"error": "Message type cannot be empty"}
+
+    # rosbridge service call to get message details
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/message_details",
+        "type": "rosapi_msgs/srv/MessageDetails",  # [ROS 2] Updated type
+        "args": {"type": message_type},
+        "id": f"get_message_details_request_{message_type.replace('/', '_')}",
+    }
+
+    # Request message details from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+
+    # Return message structure if present
+    if response and "values" in response:
+        typedefs = response["values"].get("typedefs", [])
+        if typedefs:
+            # Parse the structure into a more readable format
+            structure = {}
+            for typedef in typedefs:
+                type_name = typedef.get("type", message_type)
+                field_names = typedef.get("fieldnames", [])
+                field_types = typedef.get("fieldtypes", [])
+
+                fields = {}
+                for name, ftype in zip(field_names, field_types):
+                    fields[name] = ftype
+
+                structure[type_name] = {"fields": fields, "field_count": len(fields)}
+
+            return {"message_type": message_type, "structure": structure}
+        else:
+            return {"error": f"Message type {message_type} not found or has no definition"}
+    else:
+        return {"error": f"Failed to get details for message type {message_type}"}
+
+
+@mcp.tool(
+    description=(
+        "Get list of nodes that are publishing to a specific topic.\n"
+        "Example:\n"
+        "get_publishers_for_topic('/cmd_vel')"
+    )
+)
+def get_publishers_for_topic(topic: str) -> dict:
+    """
+    Get list of nodes that are publishing to a specific topic.
+
+    Args:
+        topic (str): The topic name (e.g., '/cmd_vel')
+
+    Returns:
+        dict: Contains list of publisher node names,
+            or a message if no publishers found.
+    """
+    # Validate input
+    if not topic or not topic.strip():
+        return {"error": "Topic name cannot be empty"}
+
+    # rosbridge service call to get publishers
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/publishers",
+        "type": "rosapi_msgs/srv/Publishers",  # [ROS 2] Updated type
+        "args": {"topic": topic},
+        "id": f"get_publishers_for_topic_request_{topic.replace('/', '_')}",
+    }
+
+    # Request publishers from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+    
+# Return publishers if present
+    if response and "values" in response:
+        publishers = response["values"].get("publishers", [])
+        return {"topic": topic, "publishers": publishers, "publisher_count": len(publishers)}
+    else:
+        return {"error": f"Failed to get publishers for topic {topic}"}
+
+
+@mcp.tool(
+    description=(
+        "Get list of nodes that are subscribed to a specific topic.\n"
+        "Example:\n"
+        "get_subscribers_for_topic('/cmd_vel')"
+    )
+)
+def get_subscribers_for_topic(topic: str) -> dict:
+    """
+    Get list of nodes that are subscribed to a specific topic.
+
+    Args:
+        topic (str): The topic name (e.g., '/cmd_vel')
+
+    Returns:
+        dict: Contains list of subscriber node names,
+            or a message if no subscribers found.
+    """
+    # Validate input
+    if not topic or not topic.strip():
+        return {"error": "Topic name cannot be empty"}
+
+    # rosbridge service call to get subscribers
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/subscribers",
+        "type": "rosapi_msgs/srv/Subscribers",  # [ROS 2] Updated type
+        "args": {"topic": topic},
+        "id": f"get_subscribers_for_topic_request_{topic.replace('/', '_')}",
+    }
+
+    # Request subscribers from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+
+    # Return subscribers if present
+    if response and "values" in response:
+        subscribers = response["values"].get("subscribers", [])
+        return {"topic": topic, "subscribers": subscribers, "subscriber_count": len(subscribers)}
+    else:
+        return {"error": f"Failed to get subscribers for topic {topic}"}
+
+
+@mcp.tool(
+    description=(
+        "Subscribe to a ROS topic and return the first message received.\n"
+        "Example:\n"
+        "subscribe_once(topic='/cmd_vel', msg_type='geometry_msgs/msg/TwistStamped')\n"
+        "subscribe_once(topic='/slow_topic', msg_type='my_package/msg/SlowMsg', timeout=None)  # Specify timeout only if topic publishes infrequently\n"
+        "subscribe_once(topic='/high_rate_topic', msg_type='sensor_msgs/msg/Image', timeout=None, queue_length=5, throttle_rate_ms=100)  # Control message buffering and rate"
+    )
+)
+def subscribe_once(
+    topic: str = "",
+    msg_type: str = "",
+    timeout: Optional[float] = None,
+    queue_length: Optional[int] = None,
+    throttle_rate_ms: Optional[int] = None,
+) -> dict:
+    """
+    Subscribe to a given ROS topic via rosbridge and return the first message received.
+
+    Args:
+        topic (str): The ROS topic name (e.g., "/cmd_vel", "/joint_states").
+        msg_type (str): The ROS message type (e.g., "geometry_msgs/msg/Twist"). # [ROS 2] Updated
+        timeout (Optional[float]): Timeout in seconds. If None, uses the default timeout.
+        queue_length (Optional[int]): How many messages to buffer before dropping old ones. Must be ≥ 1.
+        throttle_rate_ms (Optional[int]): Minimum interval between messages in milliseconds. Must be ≥ 0.
+
+    Returns:
+        dict:
+            - {"msg": <parsed ROS message>} if successful
+            - {"error": "<error message>"} if subscription or timeout fails
+    """
+    # Validate critical args before attempting subscription
+    if not topic or not msg_type:
+        return {"error": "Missing required arguments: topic and msg_type must be provided."}
+
+    # Validate optional parameters
+    if queue_length is not None and (not isinstance(queue_length, int) or queue_length < 1):
+        return {"error": "queue_length must be an integer ≥ 1"}
+
+    if throttle_rate_ms is not None and (
+        not isinstance(throttle_rate_ms, int) or throttle_rate_ms < 0
+    ):
+        return {"error": "throttle_rate_ms must be an integer ≥ 0"}
+
+    # Construct the rosbridge subscribe message
+    subscribe_msg: dict = {
+        "op": "subscribe",
+        "topic": topic,
+        "type": msg_type,
+    }
+
+    # Add optional parameters if provided
+    if queue_length is not None:
+        subscribe_msg["queue_length"] = queue_length
+
+    if throttle_rate_ms is not None:
+        subscribe_msg["throttle_rate"] = throttle_rate_ms
+
+    # Subscribe and wait for the first message
+    with ws_manager:
+        # Send subscription request
+        send_error = ws_manager.send(subscribe_msg)
+        if send_error:
+            return {"error": f"Failed to subscribe: {send_error}"}
+
+        # Use default timeout if none specified
+        actual_timeout = timeout if timeout is not None else ws_manager.default_timeout
+
+        # Loop until we receive the first message or timeout
+        end_time = time.time() + actual_timeout
+        while time.time() < end_time:
+            response = ws_manager.receive(timeout=0.5)  # non-blocking small timeout
+            if response is None:
+                continue  # idle timeout: no frame this tick
+
+            if "Image" in msg_type:
+                msg_data = parse_image(response)
+            else:
+                msg_data = parse_json(response)
+
+            if not msg_data:
+                continue  # non-JSON or empty
+
+            # Check for status errors from rosbridge
+            if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                return {"error": f"Rosbridge error: {msg_data.get('msg', 'Unknown error')}"}
+
+            # Check for the first published message
+            if msg_data.get("op") == "publish" and msg_data.get("topic") == topic:
+                # Unsubscribe before returning the message
+                unsubscribe_msg = {"op": "unsubscribe", "topic": topic}
+                ws_manager.send(unsubscribe_msg)
+                if "Image" in msg_type:
+                    return {
+                        "message": "Image received successfully and saved in the MCP server."
+                    }
+                else:
+                    return {"msg": msg_data.get("msg", {})}
+
+        # Timeout - unsubscribe and return error
+        unsubscribe_msg = {"op": "unsubscribe", "topic": topic}
+        ws_manager.send(unsubscribe_msg)
+        return {"error": "Timeout waiting for message from topic"}
+
+
+@mcp.tool(
+    description=(
+        "Publish a single message to a ROS topic.\n"
+        "Example:\n"
+        "publish_once(topic='/cmd_vel', msg_type='geometry_msgs/msg/TwistStamped', msg={'linear': {'x': 1.0}})" # [ROS 2] Updated example
+    )
+)
+def publish_once(topic: str = "", msg_type: str = "", msg: dict = {}) -> dict:
+    """
+    Publish a single message to a ROS topic via rosbridge.
+
+    Args:
+        topic (str): ROS topic name (e.g., "/cmd_vel")
+        msg_type (str): ROS message type (e.g., "geometry_msgs/msg/Twist") # [ROS 2] Updated
+        msg (dict): Message payload as a dictionary
+
+    Returns:
+        dict:
+            - {"success": True} if sent without errors
+            - {"error": "<error message>"} if connection/send failed
+            - If rosbridge responds (usually it doesn’t for publish), parsed JSON or error info
+    """
+    # Validate critical args before attempting publish
+    if not topic or not msg_type or msg == {}:
+        return {
+            "error": "Missing required arguments: topic, msg_type, and msg must all be provided."
+        }
+
+    # Use proper advertise → publish → unadvertise pattern
+    with ws_manager:
+        # 1. Advertise the topic
+        advertise_msg = {"op": "advertise", "topic": topic, "type": msg_type}
+        send_error = ws_manager.send(advertise_msg)
+        if send_error:
+            return {"error": f"Failed to advertise topic: {send_error}"}
+
+        # Check for advertise response/errors
+        response = ws_manager.receive(timeout=1.0)
+        if response:
+            try:
+                msg_data = json.loads(response)
+                if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                    return {"error": f"Advertise failed: {msg_data.get('msg', 'Unknown error')}"}
+            except json.JSONDecodeError:
+                pass  # Non-JSON response is usually fine for advertise
+
+        # 2. Publish the message
+        publish_msg = {"op": "publish", "topic": topic, "msg": msg}
+        send_error = ws_manager.send(publish_msg)
+        if send_error:
+            # Try to unadvertise even if publish failed
+            ws_manager.send({"op": "unadvertise", "topic": topic})
+            return {"error": f"Failed to publish message: {send_error}"}
+
+        # Check for publish response/errors
+        response = ws_manager.receive(timeout=1.0)
+        if response:
+            try:
+                msg_data = json.loads(response)
+                if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                    # Unadvertise before returning error
+                    ws_manager.send({"op": "unadvertise", "topic": topic})
+                    return {"error": f"Publish failed: {msg_data.get('msg', 'Unknown error')}"}
+            except json.JSONDecodeError:
+                pass  # Non-JSON response is usually fine for publish
+
+        # 3. Unadvertise the topic
+        unadvertise_msg = {"op": "unadvertise", "topic": topic}
+        ws_manager.send(unadvertise_msg)
+
+    return {
+        "success": True,
+        "note": "Message published using advertise → publish → unadvertise pattern",
+    }
+
+
+@mcp.tool(
+    description=(
+        "Subscribe to a topic for a duration and collect messages.\n"
+        "Example:\n"
+        "subscribe_for_duration(topic='/cmd_vel', msg_type='geometry_msgs/msg/TwistStamped', duration=5, max_messages=10)\n" # [ROS 2] Updated example
+        "subscribe_for_duration(topic='/high_rate_topic', msg_type='sensor_msgs/msg/Image', duration=10, queue_length=5, throttle_rate_ms=100)  # Control message buffering and rate" # [ROS 2] Updated example
+    )
+)
+def subscribe_for_duration(
+    topic: str = "",
+    msg_type: str = "",
+    duration: float = 5.0,
+    max_messages: int = 100,
+    queue_length: Optional[int] = None,
+    throttle_rate_ms: Optional[int] = None,
+) -> dict:
+    """
+    Subscribe to a ROS topic via rosbridge for a fixed duration and collect messages.
+
+    Args:
+        topic (str): ROS topic name (e.g. "/cmd_vel", "/joint_states")
+        msg_type (str): ROS message type (e.g. "geometry_msgs/msg/Twist") # [ROS 2] Updated
+        duration (float): How long (seconds) to listen for messages
+        max_messages (int): Maximum number of messages to collect before stopping
+        queue_length (Optional[int]): How many messages to buffer before dropping old ones. Must be ≥ 1.
+        throttle_rate_ms (Optional[int]): Minimum interval between messages in milliseconds. Must be ≥ 0.
+
+    Returns:
+        dict:
+            {
+                "topic": topic_name,
+                "collected_count": N,
+                "messages": [msg1, msg2, ...]
+            }
+    """
+    # Validate critical args before subscribing
+    if not topic or not msg_type:
+        return {"error": "Missing required arguments: topic and msg_type must be provided."}
+
+    # Validate optional parameters
+    if queue_length is not None and (not isinstance(queue_length, int) or queue_length < 1):
+        return {"error": "queue_length must be an integer ≥ 1"}
+
+    if throttle_rate_ms is not None and (
+        not isinstance(throttle_rate_ms, int) or throttle_rate_ms < 0
+    ):
+        return {"error": "throttle_rate_ms must be an integer ≥ 0"}
+
+    # Send subscription request
+    subscribe_msg: dict = {
+        "op": "subscribe",
+        "topic": topic,
+        "type": msg_type,
+    }
+# Add optional parameters if provided
+    if queue_length is not None:
+        subscribe_msg["queue_length"] = queue_length
+
+    if throttle_rate_ms is not None:
+        subscribe_msg["throttle_rate"] = throttle_rate_ms
+
+    with ws_manager:
+        send_error = ws_manager.send(subscribe_msg)
+        if send_error:
+            return {"error": f"Failed to subscribe: {send_error}"}
+
+        collected_messages = []
+        status_errors = []
+        end_time = time.time() + duration
+
+        # Loop until duration expires or we hit max_messages
+        while time.time() < end_time and len(collected_messages) < max_messages:
+            response = ws_manager.receive(timeout=0.5)  # non-blocking small timeout
+            if response is None:
+                continue  # idle timeout: no frame this tick
+
+            msg_data = parse_json(response)
+            if not msg_data:
+                continue  # non-JSON or empty
+
+            # Check for status errors from rosbridge
+            if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                status_errors.append(msg_data.get("msg", "Unknown error"))
+                continue
+
+            # Check for published messages matching our topic
+            if msg_data.get("op") == "publish" and msg_data.get("topic") == topic:
+                collected_messages.append(msg_data.get("msg", {}))
+
+        # Unsubscribe when done
+        unsubscribe_msg = {"op": "unsubscribe", "topic": topic}
+        ws_manager.send(unsubscribe_msg)
+
+    return {
+        "topic": topic,
+        "collected_count": len(collected_messages),
+        "messages": collected_messages,
+        "status_errors": status_errors,  # Include any errors encountered during collection
+    }
+
+
+@mcp.tool(
+    description=(
+        "Publish a sequence of messages with delays.\n"
+        "Example:\n"
+        "publish_for_durations(topic='/cmd_vel', msg_type='geometry_msgs/msg/TwistStamped', messages=[{'linear': {'x': 1.0}}, {'linear': {'x': 0.0}}], durations=[1, 2])" # [ROS 2] Updated example
+    )
+)
+def publish_for_durations(
+    topic: str = "",
+    msg_type: str = "",
+    messages: List[Dict[str, Any]] = [],
+    durations: List[float] = [],
+) -> dict:
+    """
+    Publish a sequence of messages to a given ROS topic with delays in between.
+
+    Args:
+        topic (str): ROS topic name (e.g., "/cmd_vel")
+        msg_type (str): ROS message type (e.g., "geometry_msgs/msg/Twist") # [ROS 2] Updated
+        messages (List[Dict[str, Any]]): A list of message dictionaries (ROS-compatible payloads)
+        durations (List[float]): A list of durations (seconds) to wait between messages
+
+    Returns:
+        dict:
+            {
+                "success": True,
+                "published_count": <number of messages>,
+                "topic": topic,
+                "msg_type": msg_type
+            }
+            OR {"error": "<error message>"} if something failed
+    """
+    # Validate critical args before publishing
+    if not topic or not msg_type or messages == [] or durations == []:
+        return {
+            "error": "Missing required arguments: topic, msg_type, messages, and durations must all be provided."
+        }
+
+    # Ensure same length for messages & durations
+    if len(messages) != len(durations):
+        return {"error": "messages and durations must have the same length"}
+
+    # Use proper advertise → publish → unadvertise pattern
+    with ws_manager:
+        # 1. Advertise the topic
+        advertise_msg = {"op": "advertise", "topic": topic, "type": msg_type}
+        send_error = ws_manager.send(advertise_msg)
+        if send_error:
+            return {"error": f"Failed to advertise topic: {send_error}"}
+
+        # Check for advertise response/errors
+        response = ws_manager.receive(timeout=1.0)
+        if response:
+            try:
+                msg_data = json.loads(response)
+                if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                    return {"error": f"Advertise failed: {msg_data.get('msg', 'Unknown error')}"}
+            except json.JSONDecodeError:
+                pass  # Non-JSON response is usually fine for advertise
+
+        published_count = 0
+        errors = []
+
+        # 2. Iterate and publish each message with a delay
+        for i, (msg, delay) in enumerate(zip(messages, durations)):
+            # Build the rosbridge publish message
+            publish_msg = {"op": "publish", "topic": topic, "msg": msg}
+
+            # Send it
+            send_error = ws_manager.send(publish_msg)
+            if send_error:
+                errors.append(f"Message {i + 1}: {send_error}")
+                continue  # Continue with next message instead of failing completely
+
+            # Check for publish response/errors
+            response = ws_manager.receive(timeout=1.0)
+            if response:
+                try:
+                    msg_data = json.loads(response)
+                    if msg_data.get("op") == "status" and msg_data.get("level") == "error":
+                        errors.append(f"Message {i + 1}: {msg_data.get('msg', 'Unknown error')}")
+                        continue
+                except json.JSONDecodeError:
+                    pass  # Non-JSON response is usually fine for publish
+
+            published_count += 1
+
+            # Wait before sending the next message
+            time.sleep(delay)
+
+        # 3. Unadvertise the topic
+        unadvertise_msg = {"op": "unadvertise", "topic": topic}
+        ws_manager.send(unadvertise_msg)
+
+    return {
+        "success": True,
+        "published_count": published_count,
+        "total_messages": len(messages),
+        "topic": topic,
+        "msg_type": msg_type,
+        "errors": errors,  # Include any errors encountered during publishing
+    }
+
+
+## ############################################################################################## ##
+##
+##                       ROS SERVICES
+##
+## ############################################################################################## ##
+
+
+@mcp.tool(description=("Get list of all available ROS services.\nExample:\nget_services()"))
+def get_services() -> dict:
+    """
+    Get list of all available ROS services.
+
+    Returns:
+        dict: Contains list of all active services,
+            or a message string if no services are found.
+    """
+    # rosbridge service call to get service list
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/services",
+        "type": "rosapi_msgs/srv/Services", # [ROS 2] Updated type
+        "args": {},
+        "id": "get_services_request_1",
+    }
+
+    # Request service list from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+
+    # Return service info if present
+    if response and "values" in response:
+        services = response["values"].get("services", [])
+        return {"services": services, "service_count": len(services)}
+    else:
+        return {"warning": "No services found"}
+
+
+@mcp.tool(
+    description=(
+        "Get the service type for a specific service.\nExample:\nget_service_type('/rosapi/topics')"
+    )
+)
+def get_service_type(service: str) -> dict:
+    """
+    Get the service type for a specific service.
+
+    Args:
+        service (str): The service name (e.g., '/rosapi/topics')
+
+    Returns:
+        dict: Contains the service type,
+            or an error message if service doesn't exist.
+    """
+    # Validate input
+    if not service or not service.strip():
+        return {"error": "Service name cannot be empty"}
+
+    # rosbridge service call to get service type
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/service_type",
+        "type": "rosapi_msgs/srv/ServiceType", # [ROS 2] Updated type
+        "args": {"service": service},
+        "id": f"get_service_type_request_{service.replace('/', '_')}",
+    }
+
+    # Request service type from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Check for service response errors first
+    if response and "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {"error": f"Service call failed: {error_msg}"}
+
+    # Return service type if present
+    if response and "values" in response:
+        service_type = response["values"].get("type", "")
+        if service_type:
+            return {"service": service, "type": service_type}
+        else:
+            return {"error": f"Service {service} does not exist or has no type"}
+    else:
+        return {"error": f"Failed to get type for service {service}"}
+
+
+@mcp.tool(
+    description=(
+        "Get complete service details including request and response structures.\n"
+        "Example:\n"
+        "get_service_details('my_package/srv/CustomService')" # [ROS 2] Updated example
+    )
+)
+def get_service_details(service_type: str) -> dict:
+    """
+    Get complete service details including request and response structures.
+
+    Args:
+        service_type (str): The service type (e.g., 'my_package/srv/CustomService') # [ROS 2] Updated
+
+    Returns:
+        dict: Contains complete service definition with request and response structures.
+    """
+    # Validate input
+    if not service_type or not service_type.strip():
+        return {"error": "Service type cannot be empty"}
+
+    result = {"service_type": service_type, "request": {}, "response": {}}
+
+    # Get both request and response details in a single WebSocket context
+    with ws_manager:
+        # Get request details
+        request_message = {
+            "op": "call_service",
+            "service": "/rosapi/service_request_details",
+            "type": "rosapi_msgs/srv/ServiceRequestDetails", # [ROS 2] Updated type
+            "args": {"type": service_type},
+            "id": f"get_service_details_request_{service_type.replace('/', '_')}",
+        }
+
+        request_response = ws_manager.request(request_message)
+        if request_response and "values" in request_response:
+            typedefs = request_response["values"].get("typedefs", [])
+            if typedefs:
+                for typedef in typedefs:
+                    field_names = typedef.get("fieldnames", [])
+                    field_types = typedef.get("fieldtypes", [])
+                    fields = {}
+                    for name, ftype in zip(field_names, field_types):
+                        fields[name] = ftype
+                    result["request"] = {"fields": fields, "field_count": len(fields)}
+
+        # Get response details
+        response_message = {
+            "op": "call_service",
+            "service": "/rosapi/service_response_details",
+            "type": "rosapi_msgs/srv/ServiceResponseDetails", # [ROS 2] Updated type
+            "args": {"type": service_type},
+            "id": f"get_service_details_response_{service_type.replace('/', '_')}",
+        }
+
+        response_response = ws_manager.request(response_message)
+        if response_response and "values" in response_response:
+            typedefs = response_response["values"].get("typedefs", [])
+            if typedefs:
+                for typedef in typedefs:
+                    field_names = typedef.get("fieldnames", [])
+                    field_types = typedef.get("fieldtypes", [])
+                    fields = {}
+                    for name, ftype in zip(field_names, field_types):
+                        fields[name] = ftype
+                    result["response"] = {"fields": fields, "field_count": len(fields)}
+
+    # Check if we got any data
+    if not result["request"] and not result["response"]:
+        return {"error": f"Service type {service_type} not found or has no definition"}
+
+    return result
+@mcp.tool(
+    description=(
+        "Get list of nodes that provide a specific service.\n"
+        "Example:\n"
+        "get_service_providers('/rosapi/topics')"
+    )
+)
+def get_service_providers(service: str) -> dict:
+    """
+    Get list of nodes that provide a specific service.
+
+    Args:
+        service (str): The service name (e.g., '/rosapi/topics')
+
+    Returns:
+        dict: Contains list of nodes providing this service,
+            or an error message if service doesn't exist.
+    """
+    # Validate input
+    if not service or not service.strip():
+        return {"error": "Service name cannot be empty"}
+
+    # rosbridge service call to get service providers
+    message = {
+        "op": "call_service",
+        "service": "/rosapi/service_providers",
+        "type": "rosapi_msgs/srv/ServiceProviders", # [ROS 2] Updated type
+        "args": {"service": service},
+        "id": f"get_service_providers_request_{service.replace('/', '_')}",
+    }
+
+    # Request service providers from rosbridge
+    with ws_manager:
+        response = ws_manager.request(message)
+
+    # Return service providers if present
+    if response and "values" in response:
+        providers = response["values"].get("providers", [])
+        return {"service": service, "providers": providers, "provider_count": len(providers)}
+    else:
+        return {"error": f"Failed to get providers for service {service}"}
+
+
+@mcp.tool(
+    description=(
+        "Get comprehensive information about all services including types and providers.\n"
+        "Example:\n"
+        "inspect_all_services()"
+    )
+)
+def inspect_all_services() -> dict:
+    """
+    Get comprehensive information about all services including types and providers.
+
+    Returns:
+        dict: Contains detailed information about all services,
+            including service names, types, and provider nodes.
+    """
+    # First get all services
+    services_message = {
+        "op": "call_service",
+        "service": "/rosapi/services",
+        "type": "rosapi_msgs/srv/Services", # [ROS 2] Updated type
+        "args": {},
+        "id": "inspect_all_services_request_1",
+    }
+
+    with ws_manager:
+        services_response = ws_manager.request(services_message)
+
+        if not services_response or "values" not in services_response:
+            return {"error": "Failed to get services list"}
+
+        services = services_response["values"].get("services", [])
+        service_details = {}
+
+        # Get details for each service
+        service_errors = []
+        for service in services:
+            # Get service type
+            type_message = {
+                "op": "call_service",
+                "service": "/rosapi/service_type",
+                "type": "rosapi_msgs/srv/ServiceType", # [ROS 2] Updated type
+                "args": {"service": service},
+                "id": f"get_type_{service.replace('/', '_')}",
+            }
+
+            type_response = ws_manager.request(type_message)
+            service_type = ""
+            if type_response and "values" in type_response:
+                service_type = type_response["values"].get("type", "unknown")
+            elif type_response and "error" in type_response:
+                service_errors.append(f"Service {service}: {type_response['error']}")
+
+            # Get service providers
+            providers_message = {
+                "op": "call_service",
+                "service": "/rosapi/service_providers",
+                "type": "rosapi_msgs/srv/ServiceProviders", # [ROS 2] Updated type
+                "args": {"service": service},
+                "id": f"get_providers_{service.replace('/', '_')}",
+            }
+
+            providers_response = ws_manager.request(providers_message)
+            providers = []
+            if providers_response and "values" in providers_response:
+                providers = providers_response["values"].get("providers", [])
+            elif providers_response and "error" in providers_response:
+                service_errors.append(f"Service {service} providers: {providers_response['error']}")
+
+            service_details[service] = {
+                "type": service_type,
+                "providers": providers,
+                "provider_count": len(providers),
+            }
+
+        return {
+            "total_services": len(services),
+            "services": service_details,
+            "service_errors": service_errors,  # Include any errors encountered during inspection
+        }
+
+
+@mcp.tool(
+    description=(
+        "Call a ROS service with specified request data.\n"
+        "Example:\n"
+        "call_service('/rosapi/topics', 'rosapi_msgs/srv/Topics', {})\n" # [ROS 2] Updated example
+        "call_service('/slow_service', 'my_package/srv/SlowService', {}, timeout=10.0)  # Specify timeout only for slow services" # [ROS 2] Updated example
+    )
+)
+def call_service(
+    service_name: str, service_type: str, request: dict, timeout: Optional[float] = None
+) -> dict:
+    """
+    Call a ROS service with specified request data.
+
+    Args:
+        service_name (str): The service name (e.g., '/rosapi/topics')
+        service_type (str): The service type (e.g., 'rosapi_msgs/srv/Topics') # [ROS 2] Updated
+        request (dict): Service request data as a dictionary
+        timeout (Optional[float]): Timeout in seconds. If None, uses the default timeout.
+
+    Returns:
+        dict: Contains the service response or error information.
+    """
+    # rosbridge service call
+    message = {
+        "op": "call_service",
+        "service": service_name,
+        "type": service_type,
+        "args": request,
+        "id": f"call_service_request_{service_name.replace('/', '_')}",
+    }
+
+    # Call the service through rosbridge
+    with ws_manager:
+        response = ws_manager.request(message, timeout=timeout)
+
+    # Ensure the response is always a dictionary
+    if not isinstance(response, dict):
+        return {
+            "service": service_name,
+            "service_type": service_type,
+            "success": False,
+            "error": "Received non-dictionary response from rosbridge",
+            "raw_response": response, # Include raw response for debugging
+        }
+
+    # Check for service response errors first
+    if "result" in response and not response["result"]:
+        # Service call failed - return error with details from values
+        error_msg = response.get("values", {}).get("message", "Service call failed")
+        return {
+            "service": service_name,
+            "service_type": service_type,
+            "success": False,
+            "error": f"Service call failed: {error_msg}",
+        }
+
+    # Return service response if present
+    if response.get("op") == "service_response":
+        # Alternative response format
+        return {
+            "service": service_name,
+            "service_type": service_type,
+            "success": response.get("result", True),
+            "result": response.get("values", {}),
+        }
+    elif response.get("op") == "status" and response.get("level") == "error":
+        # Error response
+        return {
+            "service": service_name,
+            "service_type": service_type,
+            "success": False,
+            "error": response.get("msg", "Unknown error"),
+        }
+    else:
+        # Unexpected response format or successful response without "service_response" op
+        # Assuming any other non-error, non-service_response is a direct success payload
+        return {
+            "service": service_name,
+            "service_type": service_type,
+            "success": True, # Default to success if no explicit error or service_response op
+            "result": response.get("values", response), # Return values or the whole response
+            "raw_response": response,
+        }
+
+
+## ############################################################################################## ##
+##
+##                       NETWORK DIAGNOSTICS
+##
+## ############################################################################################## ##
+
+
+@mcp.tool(
+    description=(
+        "Ping a robot's IP address and check if a specific port is open.\n"
+        "A successful ping to the IP but not the port can indicate that ROSbridge is not running.\n"
+        "Example:\n"
+        "ping_robot(ip='192.168.1.100', port=9090)"
+    )
+)
+def ping_robot(ip: str, port: int, ping_timeout: float = 2.0, port_timeout: float = 2.0) -> dict:
+    """
+    Ping an IP address and check if a specific port is open.
+
+    Args:
+        ip (str): The IP address to ping (e.g., '192.168.1.100')
+        port (int): The port number to check (e.g., 9090)
+        ping_timeout (float): Timeout for ping in seconds. Default = 2.0.
+        port_timeout (float): Timeout for port check in seconds. Default = 2.0.
+
+    Returns:
+        dict: Contains ping and port check results with detailed status information.
+    """
+    return ping_ip_and_port(ip, port, ping_timeout, port_timeout)
+
+## ############################################################################################## ##
+##
+##                       DATA PIPELINE (Filtering, Analysis, Regen)
+##
+## ############################################################################################## ##
+
+@mcp.tool()
+def run_filtering_pipeline(
+    xyz_path: str = "~/ros2_ws/data/ep/xyz.txt",
+    vxyz_path: str = "~/ros2_ws/data/ep/vxyz.txt",
+    fxyz_path: str = "~/ros2_ws/data/ep/fxyz.txt",
+    rpy_path: str = "~/ros2_ws/data/ep/rpy.txt",
+    out_dir: str = "~/ros2_ws/data/ep/filter_viz",
+    out_prefix: str = "~/ros2_ws/data/ep",
+    hampel_w: int = 11,
+    hampel_sig: float = 3.0,
+    ema_vxyz: float = 0.2,
+    ema_fxyz: float = 0.2,
+    ema_rpy: float = 0.1,
+) -> dict:
+    """
+    원시 데이터(xyz, vxyz, fxyz, rpy)를 읽어 필터링을 수행합니다.
+    기본적으로 xyz는 보수적으로 처리하고, vxyz/fxyz/rpy를 중심으로 필터링합니다.
+    """
+
+    xyz_path = os.path.expanduser(xyz_path)
+    vxyz_path = os.path.expanduser(vxyz_path)
+    fxyz_path = os.path.expanduser(fxyz_path)
+    rpy_path = os.path.expanduser(rpy_path)
+    out_dir = os.path.expanduser(out_dir)
+    out_prefix = os.path.expanduser(out_prefix)
+
+    cmd = f"""
+    python3 ~/ros2_ws/data/ep/filter_logs_txt.py \
+      --xyz {xyz_path} \
+      --vxyz {vxyz_path} \
+      --fxyz {fxyz_path} \
+      --rpy {rpy_path} \
+      --out_dir {out_dir} \
+      --out_prefix {out_prefix} \
+      --hampel_w {hampel_w} --hampel_sig {hampel_sig} \
+      --ema_vxyz {ema_vxyz} --ema_fxyz {ema_fxyz} --ema_rpy {ema_rpy}
+    """
+
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return {
+            "success": result.returncode == 0,
+            "paths": {
+                "xyz": xyz_path,
+                "vxyz": vxyz_path,
+                "fxyz": fxyz_path,
+                "rpy": rpy_path,
+                "out_dir": out_dir,
+                "out_prefix": out_prefix,
+            },
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@mcp.tool()
+def run_analysis_pipeline(
+    xyz_path: str = "~/ros2_ws/data/ep/xyz.txt",
+    vxyz_path: str = "~/ros2_ws/data/ep/vxyz_filtered.txt",
+    fxyz_path: str = "~/ros2_ws/data/ep/fxyz_filtered.txt",
+    rpy_path: str = "~/ros2_ws/data/ep/rpy.txt",
+    out_dir: str = "~/ros2_ws/data/ep/polish_out_filtered",
+    cell_mm: float = 1.0,
+    tool_axis: str = "+Z",
+    speed_mode: str = "xy",
+    contact_threshold_N: float = 0.5,
+    pad_radius_mm: float = 20.0,
+) -> dict:
+    """
+    연마량 분석을 수행합니다.
+
+    기본값은 현재 프로젝트 판단을 반영합니다:
+    - xyz: 원본
+    - vxyz: filtered
+    - fxyz: filtered
+    - rpy: 원본
+
+    이유:
+    - xyz는 공간 경로 왜곡을 피하기 위해 원본 유지
+    - vxyz/fxyz는 노이즈 억제를 위해 filtered 사용
+    - rpy는 현재 filtered보다 원본이 더 낫다고 판단한 상태
+    """
+
+    xyz_path = os.path.expanduser(xyz_path)
+    vxyz_path = os.path.expanduser(vxyz_path)
+    fxyz_path = os.path.expanduser(fxyz_path)
+    rpy_path = os.path.expanduser(rpy_path)
+    out_dir = os.path.expanduser(out_dir)
+
+    cmd = f"""
+    python3 ~/ros2_ws/data/ep/polish_pipeline.py analyze \
+      --xyz {xyz_path} \
+      --vxyz {vxyz_path} \
+      --fxyz {fxyz_path} \
+      --rpy {rpy_path} \
+      --out_dir {out_dir} \
+      --cell_mm {cell_mm} \
+      --tool_axis={tool_axis} \
+      --speed_mode {speed_mode} \
+      --contact_threshold_N {contact_threshold_N} \
+      --pad_radius_mm {pad_radius_mm}
+    """
+
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=os.path.expanduser("~/ros2_ws/data/ep"),
+        )
+
+        summary_text = "요약 보고서 파일이 없습니다."
+        summary_path = os.path.join(out_dir, "summary.txt")
+        if os.path.exists(summary_path):
+            with open(summary_path, "r", encoding="utf-8") as f:
+                summary_text = f.read()
+
+        return {
+            "success": result.returncode == 0,
+            "paths": {
+                "xyz": xyz_path,
+                "vxyz": vxyz_path,
+                "fxyz": fxyz_path,
+                "rpy": rpy_path,
+                "out_dir": out_dir,
+                "summary": summary_path,
+            },
+            "stdout": result.stdout + "\n[분석 결과 요약]\n" + summary_text,
+            "stderr": result.stderr,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+@mcp.tool()
+def run_regen_path(gain: float = 1.3, w_min: float = 0.3, w_max: float = 4.0, smooth_window: int = 21) -> dict:
+    """
+    분석 데이터를 기반으로 파라미터를 조정하여 새로운 재가공 경로(real_flat_filtered_new2.txt)를 생성합니다.
+    """
+    cmd = f"""
+    python3 ~/ros2_ws/data/ep/polish_pipeline.py regen \
+      --waypoints ~/ros2_ws/data/ep/real_flat_filtered.txt \
+      --removal_npz ./polish_out_filtered/removal_map.npz \
+      --out ./real_flat_filtered_new2.txt \
+      --gain {gain} \
+      --w_min {w_min} --w_max {w_max} \
+      --smooth_window {smooth_window}
+    """
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, 
+            cwd=os.path.expanduser("~/ros2_ws/data/ep")
+        )
+        return {
+            "success": result.returncode == 0,
+            "applied_parameters": {"gain": gain, "w_min": w_min, "w_max": w_max, "smooth_window": smooth_window},
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def execute_polishing_path(
+    txt_path: str,
+    log_dir: str = "~/ros2_ws/data/ep",
+    timeout: int = 300,
+) -> dict:
+    """
+    지정된 경로 파일을 읽어 C++ 가공 노드를 실행하고 데이터 로깅을 수행합니다.
+
+    Args:
+        txt_path: 실행할 경로 txt 파일
+        log_dir: 로그 저장 디렉토리
+        timeout: 최대 대기 시간(초)
+    """
+    abs_txt_path = os.path.expanduser(txt_path)
+    abs_log_dir = os.path.expanduser(log_dir)
+
+    cpp_cmd = (
+        f"ros2 run ur_custom_ik txt_ik_executor_force_patched "
+        f"--ros-args -p txt_path:={abs_txt_path}"
+    )
+    logger_cmd = f"python3 ~/ros2_ws/data/ep/auto_logger.py"
+
+    logger_process = None
+    cpp_process = None
+
+    try:
+        # 1. logger 실행
+        logger_process = subprocess.Popen(
+            logger_cmd,
+            shell=True,
+            preexec_fn=os.setsid,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=abs_log_dir,
+        )
+        time.sleep(1.0)
+
+        # 2. executor 실행
+        cpp_process = subprocess.Popen(
+            cpp_cmd,
+            shell=True,
+            preexec_fn=os.setsid,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        start_time = time.time()
+        output_log = ""
+        success = False
+
+        # 3. 비동기 로그 감시
+        while True:
+            if cpp_process.stdout is None:
+                break
+
+            reads, _, _ = select.select([cpp_process.stdout], [], [], 0.5)
+            if reads:
+                line = cpp_process.stdout.readline()
+                if not line:
+                    break
+
+                output_log += line
+
+                if "Finished." in line:
+                    success = True
+                    break
+
+                if "IK Failed for the First Point" in line:
+                    success = False
+                    break
+
+            if time.time() - start_time > timeout:
+                break
+
+        # 4. 종료 처리
+        if cpp_process is not None:
+            try:
+                os.killpg(os.getpgid(cpp_process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+
+        if logger_process is not None:
+            try:
+                os.killpg(os.getpgid(logger_process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+
+        if success:
+            return {
+                "success": True,
+                "paths": {
+                    "txt_path": abs_txt_path,
+                    "log_dir": abs_log_dir,
+                },
+                "stdout": "가공 및 데이터 로깅 성공적으로 완료됨.\n" + output_log,
+                "stderr": "",
+            }
+        else:
+            return {
+                "success": False,
+                "paths": {
+                    "txt_path": abs_txt_path,
+                    "log_dir": abs_log_dir,
+                },
+                "error": f"가공 실패 (타임아웃 또는 IK 오류).\n마지막 로그:\n{output_log[-1000:]}",
+            }
+
+    except Exception as e:
+        if cpp_process is not None:
+            try:
+                os.killpg(os.getpgid(cpp_process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+        if logger_process is not None:
+            try:
+                os.killpg(os.getpgid(logger_process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+        return {"success": False, "error": str(e)}
+    
+def main():
+    """Main entry point for the MCP server console script."""
+    if MCP_TRANSPORT == "stdio":
+        # stdio doesn't need host/port
+        mcp.run(transport="stdio")
+
+    elif MCP_TRANSPORT in {"http", "streamable-http"}:
+        # http and streamable-http both require host/port
+        print(f"Transport: {MCP_TRANSPORT} -> http://{MCP_HOST}:{MCP_PORT}")
+        mcp.run(transport=MCP_TRANSPORT, host=MCP_HOST, port=MCP_PORT)
+
+    elif MCP_TRANSPORT == "sse":
+        print(f"Transport: {MCP_TRANSPORT} -> http://{MCP_HOST}:{MCP_PORT}")
+        print("Currently unsupported. Use 'stdio', 'http', or 'streamable-http'.")
+        mcp.run(transport=MCP_TRANSPORT, host=MCP_HOST, port=MCP_PORT)
+
+    else:
+        raise ValueError(
+            f"Unsupported MCP_TRANSPORT={MCP_TRANSPORT!r}. "
+            "Use 'stdio', 'http', or 'streamable-http'."
+        )
+
+
+if __name__ == "__main__":
+    main()

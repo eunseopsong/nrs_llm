@@ -1,0 +1,288 @@
+# GEMINI.md
+
+This document is the main entry point for Gemini when controlling the robot system.
+Gemini must read this first, then integrate the information from `environments.md`.
+
+## 1) System Overview
+
+* **Robot:** UR10 with polishing tool, Intel RealSense L515 mounted on the end-effector
+* **System Version:** ROS 2 Humble (Packages: `nrs_mcp2`, `rosbridge_server`)
+* **Control interfaces:** `/go_to_pose` (absolute TCP target), `/get_tcp_pose` (read current TCP pose)
+* **Vision interfaces:** `/camera/rgb/image_raw`, `/camera/depth/image_raw`, `/camera/depth/points`
+
+## 2) Core Rules
+
+* **Message Types:** Always use ROS 2 convention (e.g., `geometry_msgs/msg/Pose` instead of `geometry_msgs/Pose`).
+* **Service Types:** Always use ROS 2 convention (e.g., `nrs_mcp2/srv/GoToPose`).
+* Always use `environments.md` coordinate conventions.
+* Respect workspace, collision, speed limits. Abort on service errors after limited retries.
+* In each scenario, do not finish each scenario until user say "Done".
+
+## 3) Services you may call
+
+**Note on Service Types:** Unless specified otherwise, custom services belong to the `nrs_mcp2` package. When using the `call_service` tool, you MUST provide the correct `service_type`.
+
+### Motion
+
+* `/go_to_pose` – Move robot to an absolute TCP pose (base frame)
+* **Type:** `nrs_mcp2/srv/GoToPose`
+
+
+* `/get_tcp_pose` – Read current TCP pose
+* **Type:** `nrs_mcp2/srv/GetTcpPose` (or `nrs_mcp2/srv/GetPose`)
+
+
+
+### Scanning
+
+* `/scan` – Save current point cloud and fMc (base→camera)
+* **Type:** `std_srvs/srv/Trigger` (or `nrs_mcp2/srv/Scan`)
+
+
+* `/registration` – Merge saved clouds using stored fMc (set service timeout 30s)
+* **Type:** `std_srvs/srv/Trigger`
+
+
+* `/reconstruction` – Generate mesh from registered point cloud (set service timeout 30s)
+* **Type:** `std_srvs/srv/Trigger`
+
+
+
+### Teaching
+
+(No direct service for teaching waypoints; handled via teach package start/end)
+
+### Path Planning
+
+* `/straight` – Generate straight-line path using saved waypoints
+* **Type:** `std_srvs/srv/Trigger`
+
+
+* `/spline` – Generate smooth spline path using saved waypoints (set service timeout 300s)
+* **Type:** `std_srvs/srv/Trigger`
+
+
+* `/interpolate` – Densify the base path (refine for execution) (set service timeout 60s)
+* **Type:** `std_srvs/srv/Trigger`
+
+
+* `/simulation` – Simulate robot motion along the path (set service timeout 60s)
+* **Type:** `std_srvs/srv/Trigger`
+
+
+
+### Robot Control
+
+* `/Iteration_set` – Set the number of repetitions for polishing trajectory
+* **Type:** `nrs_mcp2/srv/SetIteration` (Assume custom type, check with `get_service_type` if unsure)
+
+
+* `/Playback_execution` – Execute the playback trajectory along the path
+* **Type:** `std_srvs/srv/Trigger`
+
+
+
+### Package Management (Central Supervisor)
+
+* `/scan_package_start`, `/scan_package_end`
+* `/teach_package_start`, `/teach_package_end`
+* `/path_planning_package_start`, `/path_planning_package_end`
+* `/robot_control_package_start`, `/robot_control_package_end`
+
+(Each start/end pair launches or terminates the corresponding ROS node group. Usually type `std_srvs/srv/Trigger`.)
+(Gemini does not manage files; all I/O is handled by individual modules.)
+
+## 4) Scenario Overview
+
+Gemini performs a three-stage workflow:
+
+1. **Scan** – Build 3D model of the object using predefined waypoints
+2. **Teach** – Collect user-defined waypoints for desired working area
+3. **Path Planning** – Generate, refine, and simulate tool paths
+4. **Robot Control** – Execute the validated polishing trajectory on the real robot
+
+Each stage corresponds to a dedicated package that must be started and stopped explicitly.
+Gemini must control their lifecycle using the appropriate `/package_start` and `/package_end` services.
+
+## 5) Scan Scenario
+
+### Procedure
+
+1. **Ask user for target object:**
+“Which object should I scan?”
+The user answers (e.g., “fender” or “lid”).
+2. **Find waypoint list:**
+Gemini looks up the predefined waypoints for that object in this file (or `scan.md`).
+If found, confirm with user:
+“Okay, I will scan the fender. Shall I begin?”
+3. **Launch scan module:**
+Call `/scan_package_start`.
+4. **Iterate through waypoints:**
+For each waypoint:
+Call `/go_to_pose` with payload below.
+Wait for success.
+Immediately call `/scan`.
+
+### /go_to_pose Payload Template (ROS 2)
+
+When using the `call_service` tool, construct the request dictionary matching this structure:
+
+**Service Name:** `/go_to_pose`
+**Service Type:** `nrs_mcp2/srv/GoToPose`
+
+**Request JSON Structure:**
+
+```json
+{
+  "target_frame": "base",
+  "pose": {
+    "position": {"x": <X>, "y": <Y>, "z": <Z>},
+    "orientation": {"x": <QX>, "y": <QY>, "z": <QZ>, "w": <QW>}
+  },
+  "vel_scale": 0.20,
+  "acc_scale": 0.20,
+  "allowed_planning_time": 2.0,
+  "cartesian": false,
+  "eef_step": 0.002,
+  "jump_threshold": 0.0,
+  "plan_only": false
+}
+
+```
+
+**CLI Equivalent (for reference only):**
+
+```bash
+ros2 service call /go_to_pose nrs_mcp2/srv/GoToPose "{target_frame: 'base', pose: {position: {x: <X>, y: <Y>, z: <Z>}, orientation: {x: <QX>, y: <QY>, z: <QZ>, w: <QW>}}, vel_scale: 0.2, acc_scale: 0.2, allowed_planning_time: 2.0, cartesian: false, eef_step: 0.002, jump_threshold: 0.0, plan_only: false}"
+
+```
+
+### Post-Processing
+
+After all waypoints:
+
+1. (Important) Return robot to initial position.
+2. Call `/registration`, then `/reconstruction`. (set each service timeout 30s)
+Each service may take up to 30 seconds; wait patiently.
+3. On success: announce “Scanning complete, model reconstructed.”
+4. On failure: don't retry, then report and abort.
+5. If registration and reconstruction are done, Call `/scan_package_end`.
+
+## 6) Teaching Scenario
+
+### Overview
+
+After scanning is complete, Gemini must ask:
+“Would you like to teach waypoints for the working area?”
+If the user agrees, proceed with the following:
+
+### Procedure
+
+1. **Start teaching package:**
+Call `/teach_package_start`.
+This launches the hand/gesture tracking and waypoint recording node.
+2. **User Interaction:**
+The user moves their hand and points to locations on the workpiece.
+Waypoints are recorded automatically as the fingertip position is tracked.
+Gemini simply waits and provides short feedback (“Recording... point saved.”).
+3. **End teaching:**
+When the user says “Done,” call `/teach_package_end`.
+Until user says "Done", never finish this teaching Scenario.
+4. **Failure / No Points:**
+If no waypoints were recorded, ask:
+“No waypoints detected. Try again or use default path?”
+If user aborts, end teaching module safely and report.
+
+## 7) Path Planning Scenario
+
+### Overview
+
+Once waypoints are available, Gemini must plan and simulate the robot’s polishing trajectory.
+
+### Procedure
+
+1. **Ask user to start path planning package.**
+2. **Start path planning package:**
+Call `/path_planning_package_start`.
+3. **Ask user for path type:**
+“Should I generate a straight or smooth spline path?”
+`/straight` for linear connections.
+`/spline` for smooth curves.
+4. **Generate path:**
+Call the corresponding service (`/straight` or `/spline`). (set service timeout 60s)
+Wait for response (can take several seconds).
+On failure, retry once or try the alternative type.
+5. **Interpolate:**
+After a base path is created, call `/interpolate` to refine it. (set service timeout 60s)
+This step densifies waypoints for smoother motion.
+6. **Simulate:**
+Ask user to start simulation.
+Call `/simulation` to validate motion and check for collisions. (set service timeout 60s)
+These computations take time; do not treat slow responses as errors.
+If simulation fails, notify the user and ask if they want to retry or adjust the path.
+7. **Finish:**
+Do not finish simulation until user wants to start execution.
+When simulation ends and user wants to start execution, call `/path_planning_package_end`.
+Report summary: “Path validated successfully. Ready for execution.”
+
+## 8) Robot Control Scenario
+
+### Overview
+
+After simulation ends, Gemini must ask the user whether to start the actual surface finishing process on the validated path.
+If the user agrees, Gemini will control the robot execution through the robot control package.
+
+### Procedure
+
+1. **Ask user:**
+“Would you like to start the finishing process using the validated path?”
+If the user says yes, proceed.
+2. **Start robot control package:**
+Call `/robot_control_package_start`.
+This launches the real robot control program for path playback and torque-based polishing.
+3. **Set iteration:**
+Call `/Iteration_set` once.
+4. **Start polishing execution:**
+Call `/Playback_execution` twice.
+This command starts the actual trajectory execution along the planned path.
+During this time, the robot physically performs the polishing motion.
+5. **Wait for user confirmation:**
+The real polishing task may take a long time to complete.
+Never call `/robot_control_package_end` automatically.
+Gemini must continue monitoring the system state and only terminate when the user explicitly says “The finishing is done.”
+6. **End robot control package:**
+Once the user confirms that the process is complete, call `/robot_control_package_end`.
+Announce: “Finishing process complete. All stages have been successfully executed.”
+
+---
+
+## 9) Execution Outline (Summary)
+
+**SCAN STAGE:**
+`/scan_package_start`
+for each waypoint:
+`/go_to_pose` (Type: `nrs_mcp2/srv/GoToPose`) → on success → `/scan` → else retry
+`/registration` → `/reconstruction`
+`/scan_package_end`
+
+**TEACH STAGE:**
+ask → if yes → `/teach_package_start`
+user teaches → `/teach_package_end`
+
+**PATH PLANNING STAGE:**
+ask → if yes →
+`/path_planning_package_start`
+ask path type → `/straight` or `/spline`
+→ `/interpolate`
+→ ask → if yes → `/simulation`
+→ if simulation ends → `/path_planning_package_end`
+
+**ROBOT CONTROL STAGE:**
+ask → if yes →
+`/robot_control_package_start`
+ask Iteration count → `/Iteration_set` (set repetition count)
+`/Playback_execution`
+`/Playback_execution`
+wait until user says finishing is complete
+`/robot_control_package_end`
+

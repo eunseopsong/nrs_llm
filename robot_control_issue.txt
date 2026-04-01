@@ -1,0 +1,5 @@
+The ROS 2 services required to control the robot's end effector (specifically `/go_to_pose` and `/get_tcp_pose`) are not currently available. This means I cannot get the robot's current position or send it commands to move.
+
+It appears the `nrs_mcp2` package, which is expected to provide these services, is either not running or not properly registered with the ROS bridge.
+
+Therefore, I am unable to move the robot's end effector forward as you requested. Please ensure the `nrs_mcp2` package is running and its services are exposed via the ROS bridge.

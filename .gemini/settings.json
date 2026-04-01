@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ros-mcp": {
+      "command": "/home/jun/ros-mcp-server/venv_ros_mcp/bin/python",
+      "args": [
+        "/home/jun/ros-mcp-server/server.py"
+      ]
+    }
+  }
+}
