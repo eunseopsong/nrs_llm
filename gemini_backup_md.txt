@@ -4,6 +4,7 @@ This document is the main entry point for Gemini when controlling the robot syst
 Gemini must read this first, then integrate the information from `environments.md`.
 
 
+
 ## 1) System Overview
 
 * **Robot:** UR10 with polishing tool, Intel RealSense L515 mounted on the end-effector
