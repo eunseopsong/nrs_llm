@@ -1,23 +1,47 @@
-# Python virtual env
+# Python virtual environments
 venv/
 venv_ros_mcp/
 .venv/
+env/
+env_llm/
+ENV/
 
 # Python cache
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 
-# VS Code
-.vscode/
-
-# Build / dist
+# Python packaging
 build/
 dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code / IDE
+.vscode/
+.idea/
 
 # Env files
 .env
 .env.*
+!.env.example
+
+# Logs
+*.log
 
 # OS files
 .DS_Store
+Thumbs.db
+
+# Optional local artifacts
+ros_mcp.err.log
