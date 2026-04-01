@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/eunseop/nrs_llm/server.py", line 16, in <module>
+    from utils.websocket_manager import WebSocketManager, parse_image, parse_json
+  File "/home/eunseop/nrs_llm/utils/websocket_manager.py", line 6, in <module>
+    import cv2
+ModuleNotFoundError: No module named 'cv2'

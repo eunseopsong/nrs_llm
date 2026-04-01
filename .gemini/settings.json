@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "ros-mcp": {
-      "command": "/home/jun/ros-mcp-server/venv_ros_mcp/bin/python",
+      "command": "/bin/bash",
       "args": [
-        "/home/jun/ros-mcp-server/server.py"
+        "-lc",
+        "source /opt/ros/humble/setup.bash && source /home/eunseop/ros2_ws/install/setup.bash && cd /home/eunseop/nrs_llm && exec /home/eunseop/nrs_llm/env_llm/bin/python /home/eunseop/nrs_llm/server.py"
       ]
     }
   }

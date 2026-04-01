@@ -1,59 +1,38 @@
-# ros-mcp-server
+# nrs_llm
 
-ROS 2 환경에서 rosbridge를 통해 토픽, 서비스, 메시지 구조를 조회하고,  
-추가적으로 폴리싱 데이터의 필터링 / 분석 / 경로 재생성 / 경로 실행까지 수행할 수 있는 MCP 서버입니다.
+`nrs_llm` is an MCP server for ROS 2 environments. It connects to ROS through **rosbridge WebSocket** and exposes tools for:
 
-이 프로젝트는 현재 **Ubuntu + ROS 2 + rosbridge + 별도 ROS workspace(`~/ros2_ws`)** 환경을 기준으로 구성되어 있습니다.  
-따라서 다른 환경에서 실행할 경우, 아래의 디렉토리 구조와 ROS 패키지 구성을 맞추는 것이 중요합니다.
+- ROS 2 topic / service introspection
+- topic publish / subscribe workflows
+- service calls
+- robot connectivity checks
+- polishing log filtering and analysis
+- polishing path regeneration
+- TXT-based polishing path execution and logging
 
----
+This repository is designed around the following environment assumptions:
 
-## Features
+- **Ubuntu 22.04**
+- **ROS 2 Humble**
+- **Python 3.10+**
+- a separate ROS 2 workspace at `~/ros2_ws`
+- **rosbridge_server** running on `127.0.0.1:9090`
 
-- rosbridge를 통한 ROS 2 topic / service introspection
-- topic subscribe / publish
-- service call
-- 네트워크 진단 (`ping_robot`, `connect_to_robot`)
-- raw polishing log filtering
-- polishing analysis
-- regeneration path 생성
-- txt 기반 polishing path 실행 및 자동 로깅
-
----
-
-## Recommended Environment
-
-- Ubuntu 22.04
-- ROS 2 Humble
-- Python 3.10+
-- `rosbridge_server`
-- `colcon` build 가능한 ROS 2 workspace
+This README is written so that a user can set up and run `nrs_llm` from scratch.
 
 ---
 
-## Assumptions in the Current Version
+## 1. Recommended directory layout
 
-현재 버전은 다음 환경을 전제로 작성되어 있습니다.
-
-- rosbridge WebSocket 기본 주소: `127.0.0.1:9090`
-- ROS workspace 경로: `~/ros2_ws`
-- 데이터 경로: `~/ros2_ws/data/ep`
-- 가공 실행 패키지: `ur_custom_ik`
-- 실행 노드: `txt_ik_executor_force_patched`
-
-즉, 실행 환경에서도 가능하면 동일한 경로 구조를 유지하는 것을 권장합니다.
-
----
-
-## Recommended Directory Layout
+The current codebase is easiest to run when you keep the following layout:
 
 ```bash
-~/ros-mcp-server
+~/nrs_llm
 ~/ros2_ws
 ├── src
-│   └── ... (ROS 2 packages, including ur_custom_ik)
-├── install
+│   └── ... your ROS 2 packages
 ├── build
+├── install
 ├── log
 └── data
     └── ep
@@ -66,279 +45,623 @@ ROS 2 환경에서 rosbridge를 통해 토픽, 서비스, 메시지 구조를 �
         ├── filter_logs_txt.py
         ├── polish_pipeline.py
         └── ...
-````
+```
+
+If you move these paths, some parts of the polishing pipeline may fail unless you also update the corresponding paths in the code.
 
 ---
 
-## Setup
+## 2. System requirements
 
-### 1. Clone the repository
+Install the base system tools first.
 
-```bash id="xz557q"
-cd ~
-git clone <REPOSITORY_URL> ros-mcp-server
+### 2.1 Ubuntu packages
+
+```bash
+sudo apt update
+sudo apt install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-colcon-common-extensions \
+    git
 ```
 
-### 2. Prepare the ROS 2 workspace
+### 2.2 ROS 2 Humble
 
-```bash id="xcf1s5"
-cd ~
-mkdir -p ros2_ws/src
+This README assumes that **ROS 2 Humble is already installed** at:
+
+```bash
+/opt/ros/humble
 ```
 
-필요한 ROS 2 패키지들(예: `ur_custom_ik`)을 `~/ros2_ws/src` 아래에 배치합니다.
+Check it with:
+
+```bash
+test -f /opt/ros/humble/setup.bash && echo "ROS 2 Humble found" || echo "ROS 2 Humble missing"
+```
+
+If this prints `ROS 2 Humble missing`, install ROS 2 Humble first before continuing.
 
 ---
 
-### 3. Build the ROS workspace
+## 3. Clone the repository
 
-```bash id="xwlrxq"
+Clone this repository into your home directory:
+
+```bash
+cd ~
+git clone <YOUR_REPOSITORY_URL> nrs_llm
+cd ~/nrs_llm
+```
+
+If the repository is already cloned, just move into it:
+
+```bash
+cd ~/nrs_llm
+```
+
+---
+
+## 4. Create and activate the Python virtual environment
+
+This project should be run inside a dedicated virtual environment.
+
+Create the environment:
+
+```bash
+cd ~/nrs_llm
+python3 -m venv env_llm
+```
+
+Activate it:
+
+```bash
+source ~/nrs_llm/env_llm/bin/activate
+```
+
+After activation, your terminal prompt should show something like:
+
+```bash
+(env_llm) user@host:~/nrs_llm$
+```
+
+Upgrade pip:
+
+```bash
+python -m pip install --upgrade pip
+```
+
+To deactivate later:
+
+```bash
+deactivate
+```
+
+To activate again in a new terminal:
+
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+```
+
+---
+
+## 5. Install Python dependencies
+
+Install the required Python packages inside `env_llm`.
+
+### 5.1 Core packages
+
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+
+pip install \
+    fastmcp \
+    pillow \
+    numpy \
+    scipy \
+    matplotlib \
+    pandas \
+    opencv-python \
+    websocket-client
+```
+
+### 5.2 Why these packages are needed
+
+- `fastmcp`: MCP server framework
+- `pillow`: image handling
+- `numpy`, `scipy`, `matplotlib`, `pandas`: filtering / analysis utilities
+- `opencv-python`: required because `utils/websocket_manager.py` imports `cv2`
+- `websocket-client`: required because `utils/websocket_manager.py` imports `websocket`
+
+### 5.3 Verify imports
+
+Run this check after installation:
+
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+python - <<'PY'
+import cv2
+import websocket
+import numpy
+import pandas
+import scipy
+import matplotlib
+from PIL import Image
+print("All required Python imports succeeded.")
+PY
+```
+
+If this command succeeds, the Python environment is ready.
+
+---
+
+## 6. Prepare the ROS 2 workspace
+
+This project assumes a ROS 2 workspace at `~/ros2_ws`.
+
+Create it if needed:
+
+```bash
+mkdir -p ~/ros2_ws/src
+```
+
+Place your required ROS 2 packages into `~/ros2_ws/src`.
+
+The current version assumes that the workspace includes the packages needed for your robot setup and polishing execution pipeline. In the previous version, `ur_custom_ik` and the executable `txt_ik_executor_force_patched` were used by the path execution flow.
+
+---
+
+## 7. Build the ROS 2 workspace
+
+Build the workspace:
+
+```bash
 cd ~/ros2_ws
 colcon build
-source install/setup.bash
 ```
 
-매 터미널마다 아래 source를 수행하는 것을 권장합니다.
+Source the environment:
 
-```bash id="p7cwx6"
+```bash
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ```
 
----
+To confirm that the workspace source file exists:
 
-### 4. Install Python dependencies
-
-```bash id="7gbis9"
-cd ~/ros-mcp-server
-pip install fastmcp pillow
+```bash
+test -f ~/ros2_ws/install/setup.bash && echo "ROS workspace found" || echo "ROS workspace missing"
 ```
 
-추가적으로 데이터 처리 스크립트에 따라 다음 패키지가 필요할 수 있습니다.
-
-```bash id="9caum5"
-pip install numpy scipy matplotlib pandas
-```
-
-가능하다면 `requirements.txt`를 구성한 뒤 다음 방식으로 설치하는 것을 권장합니다.
-
-```bash id="mcjlwm"
-pip install -r requirements.txt
-```
+If the file is missing, the workspace has not been built successfully yet.
 
 ---
 
-## Running rosbridge
+## 8. Install and run rosbridge
 
-이 서버는 ROS 2와 직접 연결되지 않고 **rosbridge WebSocket**을 통해 통신합니다.
-따라서 먼저 rosbridge를 실행해야 합니다.
+`nrs_llm` does **not** talk directly to ROS 2. It communicates through **rosbridge WebSocket**.
 
-```bash id="v10rdq"
+### 8.1 Install rosbridge if needed
+
+If `rosbridge_server` is not installed yet:
+
+```bash
+sudo apt update
+sudo apt install -y ros-humble-rosbridge-server
+```
+
+### 8.2 Run rosbridge
+
+Open a new terminal and run:
+
+```bash
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 ```
 
-기본 포트는 `9090`입니다.
+By default, rosbridge listens on:
 
-정상 실행 여부는 다음으로 확인할 수 있습니다.
+```text
+127.0.0.1:9090
+```
 
-```bash id="t7g3ft"
+### 8.3 Verify rosbridge is listening
+
+In another terminal:
+
+```bash
 ss -ltnp | grep 9090
 ```
 
+If rosbridge is running correctly, you should see a listener on port `9090`.
+
 ---
 
-## Running the MCP Server
+## 9. Verify the repository structure
 
-기본적으로 `stdio` transport를 사용합니다.
+Before connecting `nrs_llm` to Gemini CLI, confirm that these files exist:
 
-```bash id="ffxsvs"
-cd ~/ros-mcp-server
-python3 server.py
+```bash
+test -f ~/nrs_llm/server.py && echo "server.py found" || echo "server.py missing"
+test -f ~/ros2_ws/install/setup.bash && echo "workspace setup found" || echo "workspace setup missing"
+test -f /opt/ros/humble/setup.bash && echo "ROS Humble setup found" || echo "ROS Humble setup missing"
+test -x ~/nrs_llm/env_llm/bin/python && echo "venv python found" || echo "venv python missing"
 ```
 
-환경변수로 transport를 바꾸고 싶다면 예를 들어:
+All four checks should succeed.
 
-```bash id="m7em8a"
-export MCP_TRANSPORT=streamable-http
-export MCP_HOST=127.0.0.1
-export MCP_PORT=9000
-python3 server.py
+---
+
+## 10. Configure Gemini CLI MCP in `settings.json`
+
+`nrs_llm` is intended to be launched by **Gemini CLI** as an MCP server using **stdio**.
+
+That means:
+
+- do **not** manually keep `python server.py` running in another terminal
+- Gemini CLI should launch the server itself
+- the config should source both ROS environments before starting `server.py`
+
+### 10.1 Edit the Gemini CLI `settings.json`
+
+Open the **same `settings.json` file that Gemini CLI is already reading for MCP configuration** and add the following server entry:
+
+```json
+{
+  "mcpServers": {
+    "ros-mcp": {
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "source /opt/ros/humble/setup.bash && source /home/eunseop/ros2_ws/install/setup.bash && cd /home/eunseop/nrs_llm && exec /home/eunseop/nrs_llm/env_llm/bin/python /home/eunseop/nrs_llm/server.py"
+      ]
+    }
+  }
+}
 ```
 
----
+### 10.2 Important notes about this config
 
-## Pre-run Checklist
+Replace paths if your username or directories are different.
 
-실행 전에 아래 항목을 확인하십시오.
+For the current setup shown above:
 
-* [ ] `~/ros2_ws`가 존재하는가
-* [ ] `~/ros2_ws/install/setup.bash`가 생성되었는가
-* [ ] `ur_custom_ik` 패키지가 빌드되었는가
-* [ ] `ros2 run ur_custom_ik txt_ik_executor_force_patched`가 가능한가
-* [ ] `~/ros2_ws/data/ep` 아래에 필요한 txt / python 스크립트가 존재하는가
-* [ ] rosbridge가 `127.0.0.1:9090`에서 실행 중인가
+- ROS 2 Humble source file: `/opt/ros/humble/setup.bash`
+- ROS workspace source file: `/home/eunseop/ros2_ws/install/setup.bash`
+- repository path: `/home/eunseop/nrs_llm`
+- virtual environment Python: `/home/eunseop/nrs_llm/env_llm/bin/python`
 
----
+### 10.3 Why `/bin/bash -lc` is used
 
-## Recommended First Tests
+This is important because it allows Gemini CLI to:
 
-가공 실행 전에 아래 순서로 먼저 테스트하는 것을 권장합니다.
+1. source ROS 2 Humble
+2. source your ROS 2 workspace
+3. change directory into the repository
+4. run the correct virtual environment Python
 
-1. `connect_to_robot()`
-2. `get_topics()`
-3. `get_services()`
-4. `get_topic_type('/your_topic')`
-5. `subscribe_once(...)`
-
-이 단계에서 실패하면 rosbridge 또는 ROS 환경 문제일 가능성이 큽니다.
+Without this, the server may fail with missing ROS packages, missing Python modules, or broken relative paths.
 
 ---
 
-## Default Paths Used by the Data Pipeline
+## 11. Start Gemini CLI and verify the MCP server
 
-현재 서버 코드는 다음 경로들을 기본값으로 사용합니다.
+Once `settings.json` is updated, start Gemini CLI from inside the repository environment:
 
-### Filtering
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+gemini -y
+```
 
-* `~/ros2_ws/data/ep/xyz.txt`
-* `~/ros2_ws/data/ep/vxyz.txt`
-* `~/ros2_ws/data/ep/fxyz.txt`
-* `~/ros2_ws/data/ep/rpy.txt`
+Inside Gemini CLI, run:
 
-### Analysis
+```text
+/mcp list
+```
 
-* `~/ros2_ws/data/ep/vxyz_filtered.txt`
-* `~/ros2_ws/data/ep/fxyz_filtered.txt`
-* 결과 디렉토리: `~/ros2_ws/data/ep/polish_out_filtered`
+If everything is correct, you should see `ros-mcp` in the list with a status similar to:
+
+```text
+Ready
+```
+
+If the server is connected correctly, Gemini CLI should also show the list of available tools.
+
+---
+
+## 12. First recommended checks after connection
+
+Once `/mcp list` shows `ros-mcp` as ready, test the server in this order:
+
+1. `connect_to_robot`
+2. `get_topics`
+3. `get_services`
+4. `get_topic_type`
+5. `get_service_type`
+6. `publish_once` or a read-only introspection tool
+
+This helps distinguish between:
+
+- MCP startup issues
+- rosbridge connectivity issues
+- ROS graph visibility issues
+- robot-specific execution issues
+
+---
+
+## 13. Running the server manually for debugging
+
+Even though Gemini CLI should launch the MCP server in normal use, manual execution is still useful for debugging.
+
+### 13.1 Manual debug run
+
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+python ~/nrs_llm/server.py
+```
+
+### 13.2 Better debug check with stdout / stderr separation
+
+```bash
+timeout 5s /bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/eunseop/ros2_ws/install/setup.bash && cd /home/eunseop/nrs_llm && /home/eunseop/nrs_llm/env_llm/bin/python /home/eunseop/nrs_llm/server.py' >/tmp/ros_mcp_stdout.log 2>/tmp/ros_mcp_stderr.log
+
+echo "===== STDOUT ====="
+sed -n '1,80p' /tmp/ros_mcp_stdout.log
+echo "===== STDERR ====="
+sed -n '1,80p' /tmp/ros_mcp_stderr.log
+```
+
+This is useful for catching import errors such as missing `cv2` or missing `websocket` support.
+
+---
+
+## 14. Default paths used by the polishing pipeline
+
+The current codebase assumes the following default paths for filtering / analysis / regeneration / execution:
+
+### Filtering input
+
+- `~/ros2_ws/data/ep/xyz.txt`
+- `~/ros2_ws/data/ep/vxyz.txt`
+- `~/ros2_ws/data/ep/fxyz.txt`
+- `~/ros2_ws/data/ep/rpy.txt`
+
+### Analysis input/output
+
+- `~/ros2_ws/data/ep/vxyz_filtered.txt`
+- `~/ros2_ws/data/ep/fxyz_filtered.txt`
+- output directory: `~/ros2_ws/data/ep/polish_out_filtered`
 
 ### Regeneration
 
-* 입력 경로: `~/ros2_ws/data/ep/real_flat_filtered.txt`
-* removal map: `~/ros2_ws/data/ep/polish_out_filtered/removal_map.npz`
-* 출력 경로: `~/ros2_ws/data/ep/real_flat_filtered_new2.txt`
+- input path: `~/ros2_ws/data/ep/real_flat_filtered.txt`
+- removal map: `~/ros2_ws/data/ep/polish_out_filtered/removal_map.npz`
+- output path: `~/ros2_ws/data/ep/real_flat_filtered_new2.txt`
 
-### Path Execution
+### Path execution
 
-* logger: `~/ros2_ws/data/ep/auto_logger.py`
-* executor: `ros2 run ur_custom_ik txt_ik_executor_force_patched`
+- logger: `~/ros2_ws/data/ep/auto_logger.py`
+- executor: `ros2 run ur_custom_ik txt_ik_executor_force_patched`
 
-즉, 위 경로들 중 하나라도 없으면 실행이 실패할 수 있습니다.
+If any of these files or directories are missing, the corresponding pipeline stage may fail.
 
 ---
 
-## Common Errors
+## 15. Common errors and fixes
 
-### 1) `No executable found`
+### 15.1 `ModuleNotFoundError: No module named 'cv2'`
 
-원인:
+Cause:
 
-* `ur_custom_ik`가 빌드되지 않음
-* `source ~/ros2_ws/install/setup.bash`를 안 함
-* 실행 파일 이름이 다름
+- `opencv-python` is not installed in `env_llm`
 
-해결:
+Fix:
 
-```bash id="xj0s6n"
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+pip install opencv-python
+```
+
+---
+
+### 15.2 `ModuleNotFoundError: No module named 'websocket'`
+
+Cause:
+
+- `websocket-client` is not installed in `env_llm`
+
+Fix:
+
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+pip install websocket-client
+```
+
+Note: the import name is `websocket`, but the package you install is `websocket-client`.
+
+---
+
+### 15.3 `/mcp list` shows `Disconnected`
+
+Common causes:
+
+- Gemini CLI is not reading the `settings.json` file you edited
+- the MCP server command is wrong
+- the ROS environment is not sourced
+- the virtual environment Python path is wrong
+- `server.py` crashes at startup because of missing dependencies
+- rosbridge is not running
+
+Checklist:
+
+```bash
+test -x /home/eunseop/nrs_llm/env_llm/bin/python && echo OK
+test -f /home/eunseop/nrs_llm/server.py && echo OK
+test -f /opt/ros/humble/setup.bash && echo OK
+test -f /home/eunseop/ros2_ws/install/setup.bash && echo OK
+```
+
+Then verify rosbridge:
+
+```bash
+ss -ltnp | grep 9090
+```
+
+Then run the 5-second debug command from Section 13.2.
+
+---
+
+### 15.4 `No executable found`
+
+Cause:
+
+- required ROS package was not built
+- workspace was not sourced
+- executable name is different from what the code expects
+
+Fix:
+
+```bash
 cd ~/ros2_ws
 colcon build
-source install/setup.bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
 ros2 pkg executables ur_custom_ik
 ```
 
 ---
 
-### 2) `No such file or directory`
+### 15.5 `No such file or directory`
 
-원인:
+Cause:
 
-* `~/ros2_ws/data/ep/...` 경로가 없음
-* txt / python 스크립트가 누락됨
+- missing files under `~/ros2_ws/data/ep`
+- missing polishing scripts
+- wrong path assumptions inside the code
 
-해결:
+Fix:
 
-```bash id="6he3fh"
+```bash
 ls ~/ros2_ws/data/ep
 ```
 
-필요한 파일이 모두 존재하는지 확인하십시오.
+Check that all required TXT files and scripts actually exist.
 
 ---
 
-### 3) topic / service 조회 실패
+### 15.6 pip warns about unrelated packages such as `nrs-imitation`
 
-원인:
+If your virtual environment accidentally contains unrelated editable installs, `pip` may show dependency warnings that are not directly related to `nrs_llm`.
 
-* rosbridge 미실행
-* 9090 포트 문제
-* ROS 환경 source 안 됨
+To check:
 
-해결:
+```bash
+pip show nrs-imitation
+```
 
-```bash id="i0gbkv"
+If you do not want that package inside `env_llm`, remove it:
+
+```bash
+pip uninstall -y nrs-imitation
+```
+
+---
+
+## 16. Full startup sequence (recommended)
+
+Use the following sequence every time.
+
+### Terminal 1: rosbridge
+
+```bash
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 ```
 
----
+### Terminal 2: Gemini CLI
 
-### 4) filtering / analysis만 실패
-
-원인:
-
-* `filter_logs_txt.py`, `polish_pipeline.py` 누락
-* Python 패키지 미설치
-* 입력 txt 형식 불일치
-
-해결:
-
-* 스크립트 존재 여부 확인
-* `numpy`, `scipy`, `matplotlib`, `pandas` 설치 여부 확인
-* 입력 파일 형식을 직접 점검
-
----
-
-## Notes
-
-현재 버전은 경로가 비교적 고정된 형태로 구성되어 있으므로,
-가장 안정적인 실행 방법은 아래 항목을 동일하게 유지하는 것입니다.
-
-* 저장소 위치: `~/ros-mcp-server`
-* ROS workspace 위치: `~/ros2_ws`
-* 데이터 위치: `~/ros2_ws/data/ep`
-* rosbridge 포트: `9090`
-
-즉, 코드를 수정하기보다는 환경 구조를 먼저 맞추는 방식이 가장 간단합니다.
-
----
-
-## Future Improvements
-
-향후 다음과 같은 개선을 권장합니다.
-
-* `~/ros2_ws` 하드코딩 제거
-* 환경변수 기반 workspace path 지정
-* `requirements.txt` 정리
-* 입력 파일 존재 여부 검사 추가
-* 샘플 입력 파일 제공
-* 데이터 형식 문서화
-
----
-
-## Summary
-
-이 프로젝트를 실행하려면 다음 4가지가 핵심입니다.
-
-1. ROS 2 workspace가 정상적으로 빌드되어 있을 것
-2. rosbridge가 실행 중일 것
-3. `~/ros2_ws/data/ep` 경로와 관련 스크립트/데이터가 존재할 것
-4. `ur_custom_ik` 패키지와 executor가 정상 실행될 것
-
-현재 버전은 환경 재현형 구성에 가깝기 때문에,
-동일한 폴더 구조를 유지하는 것이 가장 안정적입니다.
-
-이제 원하면 다음으로  
-**더 짧고 GitHub 느낌 나는 최종 README 버전**으로 한 번 더 압축해줄게.
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+gemini -y
 ```
+
+Inside Gemini CLI:
+
+```text
+/mcp list
+```
+
+Expected result:
+
+- `ros-mcp` appears
+- status is `Ready`
+- the MCP tools are listed
+
+---
+
+## 17. Quick command summary
+
+### One-time setup
+
+```bash
+cd ~
+git clone <YOUR_REPOSITORY_URL> nrs_llm
+cd ~/nrs_llm
+python3 -m venv env_llm
+source env_llm/bin/activate
+python -m pip install --upgrade pip
+pip install fastmcp pillow numpy scipy matplotlib pandas opencv-python websocket-client
+```
+
+### ROS workspace build
+
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws
+colcon build
+```
+
+### rosbridge run
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+```
+
+### Gemini CLI run
+
+```bash
+cd ~/nrs_llm
+source env_llm/bin/activate
+gemini -y
+```
+
+---
+
+## 18. Summary
+
+To run `nrs_llm` successfully, you need all of the following:
+
+1. ROS 2 Humble installed
+2. a built ROS 2 workspace at `~/ros2_ws`
+3. rosbridge running on port `9090`
+4. the repository cloned at `~/nrs_llm`
+5. the `env_llm` virtual environment created and activated
+6. all required Python dependencies installed
+7. Gemini CLI `settings.json` configured to launch `server.py` through `/bin/bash -lc`
+
+If you follow this README exactly, you should be able to launch Gemini CLI, run `/mcp list`, and see `ros-mcp` in the `Ready` state.
