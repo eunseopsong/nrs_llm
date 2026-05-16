@@ -1151,6 +1151,1196 @@ def ping_robot(ip: str, port: int, ping_timeout: float = 2.0, port_timeout: floa
     """
     return ping_ip_and_port(ip, port, ping_timeout, port_timeout)
 
+# --------------------------------------------------------------------------------------
+# nrspath_ws ROS shell helpers and path generation pipeline
+# --------------------------------------------------------------------------------------
+
+ROS_SHELL_SETUP = os.getenv(
+    "ROS_SHELL_SETUP",
+    "source /opt/ros/humble/setup.bash && "
+    "source ~/nrspath_ws/install/setup.bash && "
+    "source ~/dev_ws/install/setup.bash"
+
+)
+
+
+def _expand(path: str) -> str:
+    """
+    Expand '~' and convert a path to an absolute path.
+    """
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _run_ros_shell(
+    cmd: str,
+    cwd: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess:
+    """
+    Run a shell command after sourcing the ROS 2 and workspace setup files.
+
+    This is required because MCP server processes are usually launched from a
+    non-interactive shell, where ROS environment variables are not automatically set.
+    """
+    full_cmd = f"""
+    set -e
+    {ROS_SHELL_SETUP}
+    {cmd}
+    """
+
+    return subprocess.run(
+        ["bash", "-lc", full_cmd],
+        capture_output=True,
+        text=True,
+        cwd=_expand(cwd) if cwd else None,
+        timeout=timeout,
+    )
+
+
+def _popen_ros_shell(
+    cmd: str,
+    cwd: Optional[str] = None,
+    stdout=None,
+    stderr=None,
+    stdin=None,
+) -> subprocess.Popen:
+    """
+    ROS 환경을 source 한 뒤 장시간 프로세스 실행용 Popen.
+    stdin 기본값은 None이므로 기존 함수들과 호환된다.
+    """
+    full_cmd = f"""
+    set -e
+    {ROS_SHELL_SETUP}
+    {cmd}
+    """
+
+    return subprocess.Popen(
+        ["bash", "-lc", full_cmd],
+        preexec_fn=os.setsid,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        cwd=_expand(cwd) if cwd else None,
+    )
+
+
+@mcp.tool()
+def ensure_ta_path_planning_node(
+    launch_cmd: str = "ros2 launch nrs_path2 path_planning.launch.py",
+    startup_wait_sec: float = 3.0,
+) -> dict:
+    """
+    Ensure that the TA path planning node is running.
+
+    The path planning launch provides:
+    - /clicked_point subscriber
+    - /straight service
+    - /interpolation service
+
+    If /straight and /interpolation are already available, this function does not
+    launch another node to avoid duplicate ROS nodes and service conflicts.
+    """
+
+    try:
+        # 1. Check whether the required services are already available.
+        check_cmd = "ros2 service list | grep -E '^/straight$|^/interpolation$'"
+        check_res = _run_ros_shell(check_cmd, timeout=5)
+
+        if check_res.returncode == 0:
+            return {
+                "success": True,
+                "already_running": True,
+                "stdout": (
+                    "Path planning services are already available. "
+                    "No new launch process was started."
+                ),
+                "stderr": check_res.stderr,
+            }
+
+        # 2. Start the path planning launch in the background.
+        process = _popen_ros_shell(
+            launch_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        time.sleep(startup_wait_sec)
+
+        if process.poll() is not None:
+            return {
+                "success": False,
+                "already_running": False,
+                "error": (
+                    "Path planning launch process exited immediately. "
+                    "Check whether nrs_path2 and path_planning.launch.py are valid."
+                ),
+            }
+
+        # 3. Re-check services after launch.
+        check_res_after = _run_ros_shell(check_cmd, timeout=5)
+
+        if check_res_after.returncode != 0:
+            return {
+                "success": False,
+                "already_running": False,
+                "error": (
+                    "Path planning node was started, but /straight and/or "
+                    "/interpolation services were not detected."
+                ),
+                "stdout": check_res_after.stdout,
+                "stderr": check_res_after.stderr,
+            }
+
+        return {
+            "success": True,
+            "already_running": False,
+            "pid": process.pid,
+            "stdout": (
+                f"Path planning node started successfully with pid {process.pid}."
+            ),
+            "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired while checking or launching path planning node: {str(e)}",
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+def prepare_ta_zone_polishing_path(
+    region_id: int,
+    mesh_path: str = "/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl",
+    waypoint_pkg: str = "nrs_waypoint_generator",
+    waypoint_exe: str = "waypoint_generator",
+    frame_id: str = "base_link",
+    publish_rate_hz: float = 1.0,
+    straight_service: str = "/straight",
+    interpolation_service: str = "/interpolation",
+    waypoint_timeout: int = 30,
+    service_timeout: int = 1200,
+    straight_to_interpolation_wait_sec: float = 800.0,
+) -> dict:
+    """
+    Generate and publish region waypoints, then call straight and interpolation services.
+
+    Important:
+    waypoint_generator is treated as a long-running ROS node.
+    Therefore, this function does not wait for the process to exit naturally.
+    It reads stdout and terminates the process after detecting the final waypoint publish log.
+    """
+
+    if region_id not in [1, 2, 3, 4]:
+        return {
+            "success": False,
+            "error": "region_id must be one of [1, 2, 3, 4].",
+        }
+
+    abs_mesh_path = _expand(mesh_path)
+
+    if not os.path.exists(abs_mesh_path):
+        return {
+            "success": False,
+            "error": f"mesh_path not found: {abs_mesh_path}",
+        }
+
+    stage_logs = {}
+    waypoint_process = None
+
+    try:
+        # 0. Check whether the path planning services are available.
+        service_check_cmd = (
+            f"ros2 service list | grep -E '^{straight_service}$|^{interpolation_service}$'"
+        )
+        service_check_res = _run_ros_shell(service_check_cmd, timeout=5)
+
+        stage_logs["service_check_before_waypoint"] = {
+            "returncode": service_check_res.returncode,
+            "stdout": service_check_res.stdout,
+            "stderr": service_check_res.stderr,
+        }
+
+        if service_check_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "service_check_before_waypoint",
+                "error": (
+                    "Path planning services were not detected. "
+                    "Run ensure_ta_path_planning_node() first, or manually run: "
+                    "ros2 launch nrs_path2 path_planning.launch.py"
+                ),
+                "logs": stage_logs,
+            }
+
+        # 1. Generate waypoints and publish them to /clicked_point.
+        waypoint_cmd = (
+            f"ros2 run {waypoint_pkg} {waypoint_exe} "
+            f"--ros-args "
+            f"-p mesh:={abs_mesh_path} "
+            f"-p region_id:={region_id} "
+            f"-p frame_id:={frame_id} "
+            f"-p publish_rate_hz:={publish_rate_hz}"
+        )
+
+        waypoint_process = _popen_ros_shell(
+            waypoint_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        waypoint_stdout = ""
+        loaded_count = None
+        last_published = None
+        completed_publish = False
+
+        start_time = time.time()
+
+        while True:
+            # Timeout guard
+            if time.time() - start_time > waypoint_timeout:
+                break
+
+            # Process died unexpectedly or naturally.
+            if waypoint_process.poll() is not None:
+                break
+
+            if waypoint_process.stdout is None:
+                time.sleep(0.1)
+                continue
+
+            reads, _, _ = select.select([waypoint_process.stdout], [], [], 0.5)
+
+            if not reads:
+                continue
+
+            line = waypoint_process.stdout.readline()
+
+            if not line:
+                continue
+
+            waypoint_stdout += line
+
+            # Example:
+            # Loaded 36 waypoints from generated region 1
+            if "Loaded" in line and "waypoints" in line:
+                parts = line.split()
+                for i, token in enumerate(parts):
+                    if token == "Loaded" and i + 1 < len(parts):
+                        try:
+                            loaded_count = int(parts[i + 1])
+                        except ValueError:
+                            pass
+
+            # Example:
+            # Published waypoint 36/36: [...]
+            if "Published waypoint" in line:
+                try:
+                    after = line.split("Published waypoint", 1)[1].strip()
+                    fraction = after.split(":", 1)[0].strip()
+                    current_str, total_str = fraction.split("/", 1)
+                    current = int(current_str)
+                    total = int(total_str)
+
+                    last_published = current
+
+                    if current >= total:
+                        completed_publish = True
+                        loaded_count = total
+                        break
+
+                except Exception:
+                    # If parsing fails, keep collecting logs until timeout.
+                    pass
+
+        # Stop waypoint_generator after publishing is complete or timeout.
+        if waypoint_process is not None:
+            try:
+                os.killpg(os.getpgid(waypoint_process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+
+        stage_logs["generate_and_publish_waypoints"] = {
+            "returncode": waypoint_process.returncode if waypoint_process else None,
+            "stdout": waypoint_stdout,
+            "stderr": "",
+            "loaded_count": loaded_count,
+            "last_published": last_published,
+            "completed_publish": completed_publish,
+        }
+
+        if not completed_publish:
+            return {
+                "success": False,
+                "stage": "generate_and_publish_waypoints",
+                "error": (
+                    "waypoint_generator did not complete waypoint publishing before timeout. "
+                    "Check whether it printed 'Published waypoint N/N'."
+                ),
+                "logs": stage_logs,
+            }
+
+        time.sleep(0.5)
+
+        # 2. Call /straight.
+        straight_cmd = f'ros2 service call {straight_service} std_srvs/srv/Empty "{{}}"'
+        straight_res = _run_ros_shell(straight_cmd, timeout=service_timeout)
+
+        stage_logs["straight"] = {
+            "returncode": straight_res.returncode,
+            "stdout": straight_res.stdout,
+            "stderr": straight_res.stderr,
+        }
+
+        if straight_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "straight",
+                "error": "Straight path service failed.",
+                "logs": stage_logs,
+            }
+
+        
+        # straight 계산이 오래 걸리므로 충분히 대기
+        time.sleep(straight_to_interpolation_wait_sec)
+
+        # 3. Call /interpolation.
+        interp_cmd = f'ros2 service call {interpolation_service} std_srvs/srv/Empty "{{}}"'
+        interp_res = _run_ros_shell(interp_cmd, timeout=service_timeout)  
+
+        stage_logs["interpolation"] = {
+            "returncode": interp_res.returncode,
+            "stdout": interp_res.stdout,
+            "stderr": interp_res.stderr,
+        }
+
+        if interp_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "interpolation",
+                "error": "Interpolation service failed.",
+                "logs": stage_logs,
+            }
+
+        return {
+            "success": True,
+            "region_id": region_id,
+            "paths": {
+                "mesh_path": abs_mesh_path,
+            },
+            "commands": {
+                "waypoint": waypoint_cmd,
+                "straight": straight_cmd,
+                "interpolation": interp_cmd,
+            },
+            "logs": stage_logs,
+            "stdout": (
+                f"TA region {region_id} path preparation completed.\n"
+                f"mesh_path: {abs_mesh_path}\n"
+                f"published_waypoints: {last_published}/{loaded_count}\n"
+                f"services: {straight_service}, {interpolation_service}"
+            ),
+            "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired: {str(e)}",
+            "logs": stage_logs,
+        }
+
+    except Exception as e:
+        if waypoint_process is not None:
+            try:
+                os.killpg(os.getpgid(waypoint_process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": stage_logs,
+        }
+    
+# --------------------------------------------------------------------------------------
+# Isaac / Y2 polishing execution tools
+# --------------------------------------------------------------------------------------
+
+def _is_process_running(pattern: str) -> bool:
+    """
+    Check whether a process matching the given pattern is already running.
+    """
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", f"pgrep -af {pattern!r}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def _wait_for_ros_service(
+    service_name: str,
+    timeout_sec: int = 30,
+) -> dict:
+    """
+    Wait until a ROS service appears in `ros2 service list`.
+    """
+    start_time = time.time()
+    last_stdout = ""
+    last_stderr = ""
+
+    while time.time() - start_time < timeout_sec:
+        cmd = f"ros2 service list | grep -E '^{service_name}$'"
+        result = _run_ros_shell(cmd, timeout=5)
+
+        last_stdout = result.stdout
+        last_stderr = result.stderr
+
+        if result.returncode == 0:
+            return {
+                "available": True,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+
+        time.sleep(1.0)
+
+    return {
+        "available": False,
+        "stdout": last_stdout,
+        "stderr": last_stderr,
+    }
+
+
+@mcp.tool()
+def prepare_polishing_system(
+    start_bridge: bool = True,
+    start_motion: bool = True,
+    start_cmd_node: bool = True,
+    start_logger: bool = True,
+    bridge_cmd: str = "ros2 run y2_isaac_bridge joint_command_bridge",
+    motion_cmd: str = (
+        "ros2 run Y2RobMotion singleArm_motion "
+        "--ros-args "
+        "-p use_sim_time:=true "
+        "-r /joint_states:=/isaac_joint_states "
+        "-r /ur10skku/joint_states:=/isaac_joint_states"
+    ),
+    cmd_node_cmd: str = "ros2 run Y2RobMotion singleArm_cmd",
+    logger_cmd: str = "ros2 run polishing_removal polishing_removal_node",
+    single_arm_service_name: str = "/singleArm_cmd/single_arm_command",
+    logger_start_service: str = "/polishing_removal_node/start",
+    logger_end_service: str = "/polishing_removal_node/end",
+    startup_wait_sec: float = 3.0,
+    service_wait_timeout: int = 45,
+) -> dict:
+    """
+    Prepare the Isaac/Y2 polishing execution system.
+
+    This starts:
+    1. joint_command_bridge
+    2. singleArm_motion
+    3. singleArm_cmd
+    4. polishing_removal_node
+
+    The polishing_removal_node only needs to be running.
+    The actual start/end logging signals are assumed to be triggered by singleArm_cmd.
+    """
+
+    logs = {}
+    bridge_process = None
+    motion_process = None
+    cmd_process = None
+    logger_process = None
+
+    try:
+        # 1. Start joint_command_bridge.
+        if start_bridge:
+            if _is_process_running("joint_command_bridge"):
+                logs["start_bridge"] = {
+                    "already_running": True,
+                    "cmd": bridge_cmd,
+                }
+            else:
+                bridge_process = _popen_ros_shell(
+                    bridge_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(startup_wait_sec)
+
+                if bridge_process.poll() is not None:
+                    return {
+                        "success": False,
+                        "stage": "start_bridge",
+                        "error": "joint_command_bridge exited immediately.",
+                        "logs": logs,
+                    }
+
+                logs["start_bridge"] = {
+                    "already_running": False,
+                    "pid": bridge_process.pid,
+                    "cmd": bridge_cmd,
+                }
+
+        # 2. Start singleArm_motion.
+        if start_motion:
+            if _is_process_running("singleArm_motion"):
+                logs["start_motion"] = {
+                    "already_running": True,
+                    "cmd": motion_cmd,
+                }
+            else:
+                motion_process = _popen_ros_shell(
+                    motion_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(startup_wait_sec)
+
+                if motion_process.poll() is not None:
+                    return {
+                        "success": False,
+                        "stage": "start_motion",
+                        "error": "singleArm_motion exited immediately.",
+                        "logs": logs,
+                    }
+
+                logs["start_motion"] = {
+                    "already_running": False,
+                    "pid": motion_process.pid,
+                    "cmd": motion_cmd,
+                }
+
+        # 3. Start singleArm_cmd.
+        if start_cmd_node:
+            if _is_process_running("singleArm_cmd"):
+                logs["start_cmd_node"] = {
+                    "already_running": True,
+                    "cmd": cmd_node_cmd,
+                }
+            else:
+                cmd_process = _popen_ros_shell(
+                    cmd_node_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(startup_wait_sec)
+
+                if cmd_process.poll() is not None:
+                    return {
+                        "success": False,
+                        "stage": "start_cmd_node",
+                        "error": "singleArm_cmd exited immediately.",
+                        "logs": logs,
+                    }
+
+                logs["start_cmd_node"] = {
+                    "already_running": False,
+                    "pid": cmd_process.pid,
+                    "cmd": cmd_node_cmd,
+                }
+
+        # 4. Start polishing_removal_node.
+        if start_logger:
+            if _is_process_running("polishing_removal_node"):
+                logs["start_logger"] = {
+                    "already_running": True,
+                    "cmd": logger_cmd,
+                }
+            else:
+                logger_process = _popen_ros_shell(
+                    logger_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(startup_wait_sec)
+
+                if logger_process.poll() is not None:
+                    return {
+                        "success": False,
+                        "stage": "start_logger",
+                        "error": "polishing_removal_node exited immediately.",
+                        "logs": logs,
+                    }
+
+                logs["start_logger"] = {
+                    "already_running": False,
+                    "pid": logger_process.pid,
+                    "cmd": logger_cmd,
+                }
+
+        # 5. Wait for singleArm command service.
+        single_arm_service_check = _wait_for_ros_service(
+            service_name=single_arm_service_name,
+            timeout_sec=service_wait_timeout,
+        )
+        logs["single_arm_service_check"] = single_arm_service_check
+
+        if not single_arm_service_check["available"]:
+            return {
+                "success": False,
+                "stage": "single_arm_service_check",
+                "error": (
+                    f"Service {single_arm_service_name} was not available within "
+                    f"{service_wait_timeout} seconds."
+                ),
+                "logs": logs,
+            }
+
+        # 6. Check logger services if they exist.
+        # These are not called here. They are only checked for readiness.
+        logger_start_check = _wait_for_ros_service(
+            service_name=logger_start_service,
+            timeout_sec=service_wait_timeout,
+        )
+        logs["logger_start_service_check"] = logger_start_check
+
+        logger_end_check = _wait_for_ros_service(
+            service_name=logger_end_service,
+            timeout_sec=service_wait_timeout,
+        )
+        logs["logger_end_service_check"] = logger_end_check
+
+        if start_logger and not logger_start_check["available"]:
+            return {
+                "success": False,
+                "stage": "logger_start_service_check",
+                "error": (
+                    f"Logger start service {logger_start_service} was not available. "
+                    "Check polishing_removal_node service name with: ros2 service list | grep polishing"
+                ),
+                "logs": logs,
+            }
+
+        if start_logger and not logger_end_check["available"]:
+            return {
+                "success": False,
+                "stage": "logger_end_service_check",
+                "error": (
+                    f"Logger end service {logger_end_service} was not available. "
+                    "Check polishing_removal_node service name with: ros2 service list | grep polishing"
+                ),
+                "logs": logs,
+            }
+
+        return {
+            "success": True,
+            "single_arm_service_name": single_arm_service_name,
+            "logger_start_service": logger_start_service,
+            "logger_end_service": logger_end_service,
+            "logs": logs,
+            "stdout": (
+                "Polishing system is ready.\n"
+                f"SingleArmCommand service: {single_arm_service_name}\n"
+                f"Logger node: {'enabled' if start_logger else 'disabled'}\n"
+                "Logger start/end are expected to be triggered by singleArm_cmd."
+            ),
+            "stderr": "",
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": logs,
+        }
+
+@mcp.tool()
+def stop_polishing_system(
+    kill_bridge: bool = True,
+    kill_motion: bool = True,
+    kill_cmd_node: bool = True,
+    kill_logger: bool = True,
+    kill_patterns: Optional[List[str]] = None,
+) -> dict:
+    """
+    Stop ROS processes related to the Isaac/Y2 polishing execution pipeline.
+
+    This is needed because processes started by Gemini/MCP can remain alive
+    even after the Gemini CLI is closed.
+
+    Default targets:
+    - y2_isaac_bridge joint_command_bridge
+    - Y2RobMotion singleArm_motion
+    - Y2RobMotion singleArm_cmd
+    """
+
+    logs = {}
+
+    # 기본 종료 대상
+    patterns = []
+
+    if kill_bridge:
+        patterns.extend([
+            "joint_command_bridge",
+            "ros2 run y2_isaac_bridge joint_command_bridge",
+        ])
+
+    if kill_motion:
+        patterns.extend([
+            "singleArm_motion",
+            "ros2 run Y2RobMotion singleArm_motion",
+        ])
+
+    if kill_cmd_node:
+        patterns.extend([
+            "singleArm_cmd",
+            "ros2 run Y2RobMotion singleArm_cmd",
+        ])
+
+    if kill_logger:
+        patterns.extend([
+            "polishing_removal_node",
+            "ros2 run polishing_removal polishing_removal_node",
+        ])
+
+    # 필요하면 사용자가 추가 패턴을 넘길 수 있게 함
+    if kill_patterns:
+        patterns.extend(kill_patterns)
+
+    # 중복 제거
+    patterns = list(dict.fromkeys(patterns))
+
+    try:
+        for pattern in patterns:
+            # 종료 전 확인
+            before_cmd = f"pgrep -af {pattern!r} || true"
+            before_res = subprocess.run(
+                ["bash", "-lc", before_cmd],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            # 종료
+            kill_cmd = f"pkill -f {pattern!r} || true"
+            kill_res = subprocess.run(
+                ["bash", "-lc", kill_cmd],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            time.sleep(0.3)
+
+            # 종료 후 확인
+            after_cmd = f"pgrep -af {pattern!r} || true"
+            after_res = subprocess.run(
+                ["bash", "-lc", after_cmd],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            logs[pattern] = {
+                "before": before_res.stdout,
+                "kill_returncode": kill_res.returncode,
+                "kill_stdout": kill_res.stdout,
+                "kill_stderr": kill_res.stderr,
+                "after": after_res.stdout,
+            }
+
+        # 최종 관련 프로세스 확인
+        final_check_cmd = (
+            "pgrep -af 'joint_command_bridge|singleArm_motion|singleArm_cmd|polishing_removal_node' || true"
+        )
+        final_check_res = subprocess.run(
+            ["bash", "-lc", final_check_cmd],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        still_running = bool(final_check_res.stdout.strip())
+
+        return {
+            "success": not still_running,
+            "still_running": still_running,
+            "remaining_processes": final_check_res.stdout,
+            "logs": logs,
+            "stdout": (
+                "Polishing ROS processes stopped."
+                if not still_running
+                else "Some polishing ROS processes are still running."
+            ),
+            "stderr": "",
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": logs,
+        }
+
+
+@mcp.tool()
+def execute_polishing_by_path(
+    load_file: str = "",
+    service_name: str = "/singleArm_cmd/single_arm_command",
+    service_type: str = "y2_rob_motion_interfaces/srv/SingleArmCommand",
+    command_mode: str = "TxtLoad",
+    service_wait_timeout: int = 30,
+    service_call_timeout: int = 300,
+) -> dict:
+    """
+    Execute polishing by calling the SingleArmCommand service.
+
+    The singleArm_cmd node is assumed to publish/trigger polishing logger
+    start and end automatically.
+
+    Equivalent shell command:
+
+    ros2 service call /singleArm_cmd/single_arm_command \
+      y2_rob_motion_interfaces/srv/SingleArmCommand \
+      "{command_mode: 'TxtLoad', target_pose: [], load_file: ''}"
+    """
+
+    logs = {}
+
+    try:
+        # 1. Check service availability.
+        service_check = _wait_for_ros_service(
+            service_name=service_name,
+            timeout_sec=service_wait_timeout,
+        )
+        logs["service_check"] = service_check
+
+        if not service_check["available"]:
+            return {
+                "success": False,
+                "stage": "service_check",
+                "error": (
+                    f"Service {service_name} was not available within "
+                    f"{service_wait_timeout} seconds. "
+                    "Run prepare_polishing_system first."
+                ),
+                "logs": logs,
+            }
+
+        # 2. Call SingleArmCommand service.
+        request_yaml = (
+            "{"
+            f"command_mode: '{command_mode}', "
+            "target_pose: [], "
+            f"load_file: '{load_file}'"
+            "}"
+        )
+
+        service_cmd = (
+            f"ros2 service call {service_name} {service_type} "
+            f"\"{request_yaml}\""
+        )
+
+        service_res = _run_ros_shell(
+            service_cmd,
+            timeout=service_call_timeout,
+        )
+
+        logs["service_call"] = {
+            "returncode": service_res.returncode,
+            "stdout": service_res.stdout,
+            "stderr": service_res.stderr,
+            "cmd": service_cmd,
+            "request": {
+                "command_mode": command_mode,
+                "target_pose": [],
+                "load_file": load_file,
+            },
+        }
+
+        if service_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "service_call",
+                "error": "SingleArmCommand service call failed.",
+                "logs": logs,
+            }
+
+        return {
+            "success": True,
+            "service_name": service_name,
+            "service_type": service_type,
+            "command_mode": command_mode,
+            "load_file": load_file,
+            "logs": logs,
+            "stdout": (
+                "Polishing execution command was sent successfully.\n"
+                f"command_mode: {command_mode}\n"
+                f"load_file: {load_file!r}\n"
+                "Logger start/end are expected to be handled by singleArm_cmd."
+            ),
+            "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired: {str(e)}",
+            "logs": logs,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": logs,
+        }
+
+@mcp.tool()
+def execute_polishing_by_shape_copy(
+    shape: str,
+    txt_dir: str = "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/txtcmd",
+    active_file: str = "cmd_continue9D.txt",
+    service_name: str = "/singleArm_cmd/single_arm_command",
+    service_type: str = "y2_rob_motion_interfaces/srv/SingleArmCommand",
+    command_mode: str = "TxtLoad",
+    service_wait_timeout: int = 30,
+    service_call_timeout: int = 300,
+) -> dict:
+    """
+    Select flat/convex txt path, copy it into cmd_continue9D.txt,
+    then execute TxtLoad.
+
+    Natural language examples:
+      - flat으로 실행해줘
+      - flat 경로로 폴리싱해줘
+      - 평면 경로로 해줘
+      - convex로 실행해줘
+      - convex 경로로 폴리싱해줘
+      - 볼록 경로로 해줘
+      - 곡면 경로로 해줘
+
+    Mapping:
+      flat   -> cmd_continue9D_flat_4.txt  -> cmd_continue9D.txt
+      convex -> cmd_continue9D_convex_2.txt -> cmd_continue9D.txt
+    """
+
+    logs = {}
+
+    try:
+        # ------------------------------------------------------------
+        # 1. 입력 자연어 정규화
+        # ------------------------------------------------------------
+        shape_raw = shape.strip()
+        shape_key = shape_raw.lower().replace("_", " ").replace("-", " ")
+
+        flat_keywords = [
+            "flat",
+            "plane",
+            "planar",
+            "평면",
+            "플랫",
+            "평평",
+        ]
+
+        convex_keywords = [
+            "convex",
+            "curved",
+            "curve",
+            "볼록",
+            "곡면",
+            "컨벡스",
+        ]
+
+        has_flat = any(keyword in shape_key for keyword in flat_keywords)
+        has_convex = any(keyword in shape_key for keyword in convex_keywords)
+
+        if has_flat and not has_convex:
+            selected_shape = "flat"
+            selected_file = "cmd_continue9D_flat_4.txt"
+
+        elif has_convex and not has_flat:
+            selected_shape = "convex"
+            selected_file = "cmd_continue9D_convex_2.txt"
+
+        elif has_flat and has_convex:
+            return {
+                "success": False,
+                "stage": "shape_select",
+                "error": (
+                    "Both flat and convex keywords were detected. "
+                    "Please specify only one path type."
+                ),
+                "received_shape": shape_raw,
+            }
+
+        else:
+            return {
+                "success": False,
+                "stage": "shape_select",
+                "error": (
+                    "Could not determine path type. "
+                    "Use flat/평면/플랫 or convex/볼록/곡면."
+                ),
+                "received_shape": shape_raw,
+            }
+
+        # ------------------------------------------------------------
+        # 2. 파일 경로 생성
+        # ------------------------------------------------------------
+        abs_txt_dir = _expand(txt_dir)
+
+        selected_path = os.path.join(abs_txt_dir, selected_file)
+        active_path = os.path.join(abs_txt_dir, active_file)
+
+        # ------------------------------------------------------------
+        # 3. 선택 파일 존재 확인
+        # ------------------------------------------------------------
+        if not os.path.exists(selected_path):
+            return {
+                "success": False,
+                "stage": "path_check",
+                "error": f"Selected txt file not found: {selected_path}",
+                "received_shape": shape_raw,
+                "selected_shape": selected_shape,
+                "selected_file": selected_file,
+                "selected_path": selected_path,
+                "active_path": active_path,
+            }
+
+        # ------------------------------------------------------------
+        # 4. 선택 파일을 cmd_continue9D.txt로 복사
+        # ------------------------------------------------------------
+        copy_cmd = f"cp '{selected_path}' '{active_path}'"
+
+        copy_res = _run_ros_shell(
+            copy_cmd,
+            timeout=30,
+        )
+
+        logs["copy_selected_path_to_active_path"] = {
+            "returncode": copy_res.returncode,
+            "stdout": copy_res.stdout,
+            "stderr": copy_res.stderr,
+            "cmd": copy_cmd,
+            "selected_shape": selected_shape,
+            "selected_path": selected_path,
+            "active_path": active_path,
+        }
+
+        if copy_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "copy_selected_path_to_active_path",
+                "error": "Failed to copy selected txt file into cmd_continue9D.txt.",
+                "logs": logs,
+            }
+
+        # ------------------------------------------------------------
+        # 5. SingleArmCommand 서비스 준비 확인
+        # ------------------------------------------------------------
+        service_check = _wait_for_ros_service(
+            service_name=service_name,
+            timeout_sec=service_wait_timeout,
+        )
+
+        logs["service_check"] = service_check
+
+        if not service_check["available"]:
+            return {
+                "success": False,
+                "stage": "service_check",
+                "error": (
+                    f"Service {service_name} was not available within "
+                    f"{service_wait_timeout} seconds. "
+                    "Run prepare_polishing_system first."
+                ),
+                "logs": logs,
+            }
+
+        # ------------------------------------------------------------
+        # 6. TxtLoad 서비스 호출
+        #    load_file은 빈 문자열로 둔다.
+        #    그러면 singleArm_cmd가 기본 cmd_continue9D.txt를 읽는다.
+        # ------------------------------------------------------------
+        request_yaml = (
+            "{"
+            f"command_mode: '{command_mode}', "
+            "target_pose: [], "
+            "load_file: ''"
+            "}"
+        )
+
+        service_cmd = (
+            f"ros2 service call {service_name} {service_type} "
+            f"\"{request_yaml}\""
+        )
+
+        service_res = _run_ros_shell(
+            service_cmd,
+            timeout=service_call_timeout,
+        )
+
+        logs["service_call"] = {
+            "returncode": service_res.returncode,
+            "stdout": service_res.stdout,
+            "stderr": service_res.stderr,
+            "cmd": service_cmd,
+            "request": {
+                "command_mode": command_mode,
+                "target_pose": [],
+                "load_file": "",
+            },
+        }
+
+        if service_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "service_call",
+                "error": "SingleArmCommand service call failed.",
+                "logs": logs,
+            }
+
+        return {
+            "success": True,
+            "received_shape": shape_raw,
+            "selected_shape": selected_shape,
+            "selected_file": selected_file,
+            "selected_path": selected_path,
+            "active_path": active_path,
+            "service_name": service_name,
+            "command_mode": command_mode,
+            "logs": logs,
+            "stdout": (
+                "Polishing execution command was sent successfully.\n"
+                f"received_shape: {shape_raw}\n"
+                f"selected_shape: {selected_shape}\n"
+                f"selected_file: {selected_file}\n"
+                f"copied_to: {active_path}\n"
+                f"command_mode: {command_mode}\n"
+                "load_file: ''\n"
+            ),
+            "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired: {str(e)}",
+            "logs": logs,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": logs,
+        }
+
 ## ############################################################################################## ##
 ##
 ##                       DATA PIPELINE (Filtering, Analysis, Regen)
