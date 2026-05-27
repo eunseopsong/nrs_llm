@@ -1,0 +1,4 @@
+SpeechRecognition
+pynput
+PyAudio
+requests

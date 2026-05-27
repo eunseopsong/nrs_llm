@@ -1325,7 +1325,7 @@ def prepare_ta_zone_polishing_path(
     publish_rate_hz: float = 1.0,
     straight_service: str = "/straight",
     interpolation_service: str = "/interpolation",
-    waypoint_timeout: int = 30,
+    waypoint_timeout: int = 90,
     service_timeout: int = 1200,
     straight_to_interpolation_wait_sec: float = 800.0,
 ) -> dict:
@@ -1623,232 +1623,488 @@ def _wait_for_ros_service(
         "stderr": last_stderr,
     }
 
-
 @mcp.tool()
-def prepare_polishing_system(
-    start_bridge: bool = True,
-    start_motion: bool = True,
-    start_cmd_node: bool = True,
-    start_logger: bool = True,
-    bridge_cmd: str = "ros2 run y2_isaac_bridge joint_command_bridge",
-    motion_cmd: str = (
-        "ros2 run Y2RobMotion singleArm_motion "
-        "--ros-args "
-        "-p use_sim_time:=true "
-        "-r /joint_states:=/isaac_joint_states "
-        "-r /ur10skku/joint_states:=/isaac_joint_states"
-    ),
-    cmd_node_cmd: str = "ros2 run Y2RobMotion singleArm_cmd",
-    logger_cmd: str = "ros2 run polishing_removal polishing_removal_node",
-    single_arm_service_name: str = "/singleArm_cmd/single_arm_command",
-    logger_start_service: str = "/polishing_removal_node/start",
-    logger_end_service: str = "/polishing_removal_node/end",
-    startup_wait_sec: float = 3.0,
-    service_wait_timeout: int = 45,
+def extract_ta_waypoints_only(
+    region_id: int,
+    mesh_path: str = "/home/eunseop/isaac/isaac_save/surface/workpiece_8.stl",
+    waypoint_pkg: str = "nrs_waypoint_generator",
+    waypoint_exe: str = "waypoint_generator",
+    frame_id: str = "base_link",
+    publish_rate_hz: float = 1.0,
+    waypoint_timeout: int = 90,
 ) -> dict:
     """
-    Prepare the Isaac/Y2 polishing execution system.
+    Extract and publish TA region waypoints only.
 
-    This starts:
-    1. joint_command_bridge
-    2. singleArm_motion
-    3. singleArm_cmd
-    4. polishing_removal_node
+    Use this tool when the user says:
+    - stl 불러와서 특징점만 추출해줘
+    - STL에서 특징점 뽑아줘
+    - 특징점만 생성해줘
+    - waypoint만 추출해줘
+    - region 1 특징점 추출해줘
+    - extract feature points from STL
+    - generate waypoints only
 
-    The polishing_removal_node only needs to be running.
-    The actual start/end logging signals are assumed to be triggered by singleArm_cmd.
+    This tool:
+    1. Loads the STL mesh.
+    2. Runs nrs_waypoint_generator waypoint_generator.
+    3. Publishes generated waypoints to /clicked_point.
+    4. Stops after detecting "Published waypoint N/N".
+    5. Does NOT kill waypoint_generator.
+    6. Does NOT call /straight or /interpolation.
+
+    After this tool succeeds, wait for the user's next command.
+    If the user asks for straight/interpolation, call run_ta_straight_interpolation_only().
     """
 
+    if region_id not in [1, 2, 3, 4]:
+        return {
+            "success": False,
+            "error": "region_id must be one of [1, 2, 3, 4].",
+        }
+
+    abs_mesh_path = _expand(mesh_path)
+
+    if not os.path.exists(abs_mesh_path):
+        return {
+            "success": False,
+            "error": f"mesh_path not found: {abs_mesh_path}",
+        }
+
     logs = {}
-    bridge_process = None
-    motion_process = None
-    cmd_process = None
-    logger_process = None
+    waypoint_process = None
 
     try:
-        # 1. Start joint_command_bridge.
-        if start_bridge:
-            if _is_process_running("joint_command_bridge"):
-                logs["start_bridge"] = {
-                    "already_running": True,
-                    "cmd": bridge_cmd,
-                }
-            else:
-                bridge_process = _popen_ros_shell(
-                    bridge_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                time.sleep(startup_wait_sec)
-
-                if bridge_process.poll() is not None:
-                    return {
-                        "success": False,
-                        "stage": "start_bridge",
-                        "error": "joint_command_bridge exited immediately.",
-                        "logs": logs,
-                    }
-
-                logs["start_bridge"] = {
-                    "already_running": False,
-                    "pid": bridge_process.pid,
-                    "cmd": bridge_cmd,
-                }
-
-        # 2. Start singleArm_motion.
-        if start_motion:
-            if _is_process_running("singleArm_motion"):
-                logs["start_motion"] = {
-                    "already_running": True,
-                    "cmd": motion_cmd,
-                }
-            else:
-                motion_process = _popen_ros_shell(
-                    motion_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                time.sleep(startup_wait_sec)
-
-                if motion_process.poll() is not None:
-                    return {
-                        "success": False,
-                        "stage": "start_motion",
-                        "error": "singleArm_motion exited immediately.",
-                        "logs": logs,
-                    }
-
-                logs["start_motion"] = {
-                    "already_running": False,
-                    "pid": motion_process.pid,
-                    "cmd": motion_cmd,
-                }
-
-        # 3. Start singleArm_cmd.
-        if start_cmd_node:
-            if _is_process_running("singleArm_cmd"):
-                logs["start_cmd_node"] = {
-                    "already_running": True,
-                    "cmd": cmd_node_cmd,
-                }
-            else:
-                cmd_process = _popen_ros_shell(
-                    cmd_node_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                time.sleep(startup_wait_sec)
-
-                if cmd_process.poll() is not None:
-                    return {
-                        "success": False,
-                        "stage": "start_cmd_node",
-                        "error": "singleArm_cmd exited immediately.",
-                        "logs": logs,
-                    }
-
-                logs["start_cmd_node"] = {
-                    "already_running": False,
-                    "pid": cmd_process.pid,
-                    "cmd": cmd_node_cmd,
-                }
-
-        # 4. Start polishing_removal_node.
-        if start_logger:
-            if _is_process_running("polishing_removal_node"):
-                logs["start_logger"] = {
-                    "already_running": True,
-                    "cmd": logger_cmd,
-                }
-            else:
-                logger_process = _popen_ros_shell(
-                    logger_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                time.sleep(startup_wait_sec)
-
-                if logger_process.poll() is not None:
-                    return {
-                        "success": False,
-                        "stage": "start_logger",
-                        "error": "polishing_removal_node exited immediately.",
-                        "logs": logs,
-                    }
-
-                logs["start_logger"] = {
-                    "already_running": False,
-                    "pid": logger_process.pid,
-                    "cmd": logger_cmd,
-                }
-
-        # 5. Wait for singleArm command service.
-        single_arm_service_check = _wait_for_ros_service(
-            service_name=single_arm_service_name,
-            timeout_sec=service_wait_timeout,
+        # ------------------------------------------------------------
+        # 1. Run waypoint_generator only.
+        #    straight / interpolation services are intentionally skipped.
+        # ------------------------------------------------------------
+        waypoint_cmd = (
+            f"ros2 run {waypoint_pkg} {waypoint_exe} "
+            f"--ros-args "
+            f"-p mesh:={abs_mesh_path} "
+            f"-p region_id:={region_id} "
+            f"-p frame_id:={frame_id} "
+            f"-p publish_rate_hz:={publish_rate_hz}"
         )
-        logs["single_arm_service_check"] = single_arm_service_check
 
-        if not single_arm_service_check["available"]:
+        waypoint_process = _popen_ros_shell(
+            waypoint_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        waypoint_stdout = ""
+        loaded_count = None
+        last_published = None
+        completed_publish = False
+
+        start_time = time.time()
+
+        while True:
+            # Timeout guard
+            if time.time() - start_time > waypoint_timeout:
+                break
+
+            # Process died unexpectedly or naturally.
+            if waypoint_process.poll() is not None:
+                break
+
+            if waypoint_process.stdout is None:
+                time.sleep(0.1)
+                continue
+
+            reads, _, _ = select.select([waypoint_process.stdout], [], [], 0.5)
+
+            if not reads:
+                continue
+
+            line = waypoint_process.stdout.readline()
+
+            if not line:
+                continue
+
+            waypoint_stdout += line
+
+            # Example:
+            # Loaded 36 waypoints from generated region 1
+            if "Loaded" in line and "waypoints" in line:
+                parts = line.split()
+                for i, token in enumerate(parts):
+                    if token == "Loaded" and i + 1 < len(parts):
+                        try:
+                            loaded_count = int(parts[i + 1])
+                        except ValueError:
+                            pass
+
+            # Example:
+            # Published waypoint 36/36: [...]
+            if "Published waypoint" in line:
+                try:
+                    after = line.split("Published waypoint", 1)[1].strip()
+                    fraction = after.split(":", 1)[0].strip()
+                    current_str, total_str = fraction.split("/", 1)
+                    current = int(current_str)
+                    total = int(total_str)
+
+                    last_published = current
+
+                    if current >= total:
+                        completed_publish = True
+                        loaded_count = total
+                        break
+
+                except Exception:
+                    # If parsing fails, keep collecting logs until timeout.
+                    pass
+
+        # ------------------------------------------------------------
+        # 중요:
+        # waypoint_generator를 죽이지 않는다.
+        #
+        # 이유:
+        # - 특징점 추출 후 사진/시각화 창이 떠야 함
+        # - 다음 단계인 straight/interpolation은 사용자의 별도 명령으로 실행해야 함
+        # ------------------------------------------------------------
+
+        logs["extract_and_publish_waypoints"] = {
+            "returncode": waypoint_process.returncode if waypoint_process else None,
+            "stdout": waypoint_stdout,
+            "stderr": "",
+            "loaded_count": loaded_count,
+            "last_published": last_published,
+            "completed_publish": completed_publish,
+            "cmd": waypoint_cmd,
+            "mesh_path": abs_mesh_path,
+            "region_id": region_id,
+            "waypoint_process_pid": waypoint_process.pid if waypoint_process else None,
+            "note": (
+                "straight and interpolation were intentionally skipped. "
+                "waypoint_generator was intentionally not killed."
+            ),
+        }
+
+        if not completed_publish:
             return {
                 "success": False,
-                "stage": "single_arm_service_check",
+                "stage": "extract_and_publish_waypoints",
                 "error": (
-                    f"Service {single_arm_service_name} was not available within "
-                    f"{service_wait_timeout} seconds."
-                ),
-                "logs": logs,
-            }
-
-        # 6. Check logger services if they exist.
-        # These are not called here. They are only checked for readiness.
-        logger_start_check = _wait_for_ros_service(
-            service_name=logger_start_service,
-            timeout_sec=service_wait_timeout,
-        )
-        logs["logger_start_service_check"] = logger_start_check
-
-        logger_end_check = _wait_for_ros_service(
-            service_name=logger_end_service,
-            timeout_sec=service_wait_timeout,
-        )
-        logs["logger_end_service_check"] = logger_end_check
-
-        if start_logger and not logger_start_check["available"]:
-            return {
-                "success": False,
-                "stage": "logger_start_service_check",
-                "error": (
-                    f"Logger start service {logger_start_service} was not available. "
-                    "Check polishing_removal_node service name with: ros2 service list | grep polishing"
-                ),
-                "logs": logs,
-            }
-
-        if start_logger and not logger_end_check["available"]:
-            return {
-                "success": False,
-                "stage": "logger_end_service_check",
-                "error": (
-                    f"Logger end service {logger_end_service} was not available. "
-                    "Check polishing_removal_node service name with: ros2 service list | grep polishing"
+                    "waypoint_generator did not complete waypoint publishing before timeout. "
+                    "Check whether it printed 'Published waypoint N/N'."
                 ),
                 "logs": logs,
             }
 
         return {
             "success": True,
-            "single_arm_service_name": single_arm_service_name,
-            "logger_start_service": logger_start_service,
-            "logger_end_service": logger_end_service,
+            "region_id": region_id,
+            "ready_for_next_command": True,
+            "next_expected_command": (
+                "Ask for straight/interpolation if you want to continue path planning."
+            ),
+            "paths": {
+                "mesh_path": abs_mesh_path,
+            },
+            "commands": {
+                "waypoint": waypoint_cmd,
+            },
             "logs": logs,
             "stdout": (
-                "Polishing system is ready.\n"
-                f"SingleArmCommand service: {single_arm_service_name}\n"
-                f"Logger node: {'enabled' if start_logger else 'disabled'}\n"
-                "Logger start/end are expected to be triggered by singleArm_cmd."
+                f"TA region {region_id} waypoint extraction completed.\n"
+                f"mesh_path: {abs_mesh_path}\n"
+                f"published_waypoints: {last_published}/{loaded_count}\n"
+                "straight: skipped\n"
+                "interpolation: skipped\n"
+                "polishing execution: skipped\n"
+                "waypoint_generator: kept alive\n"
+                "Status: waiting for the user's next command."
             ),
             "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired: {str(e)}",
+            "logs": logs,
+        }
+
+    except Exception as e:
+        # 여기서도 waypoint_generator를 죽이지 않는다.
+        # GUI/사진 확인이 필요한 경우 프로세스가 살아 있어야 할 수 있음.
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": logs,
+        }
+
+@mcp.tool()
+def run_ta_straight_interpolation_only(
+    straight_service: str = "/straight",
+    interpolation_service: str = "/interpolation",
+    service_timeout: int = 1200,
+    straight_to_interpolation_wait_sec: float = 800.0,
+) -> dict:
+    """
+    Run TA path planning services only.
+
+    Use this after extract_ta_waypoints_only() has already published waypoints.
+
+    This tool:
+    1. Checks /straight and /interpolation services.
+    2. Calls /straight.
+    3. Waits for straight_to_interpolation_wait_sec.
+    4. Calls /interpolation.
+
+    This tool does NOT:
+    - load STL
+    - extract waypoints
+    - run waypoint_generator
+    - execute robot polishing
+    """
+
+    logs = {}
+
+    try:
+        # 1. Check services
+        service_check_cmd = (
+            f"ros2 service list | grep -E '^{straight_service}$|^{interpolation_service}$'"
+        )
+        service_check_res = _run_ros_shell(service_check_cmd, timeout=5)
+
+        logs["service_check"] = {
+            "returncode": service_check_res.returncode,
+            "stdout": service_check_res.stdout,
+            "stderr": service_check_res.stderr,
+        }
+
+        if service_check_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "service_check",
+                "error": (
+                    "Path planning services were not detected. "
+                    "Run ensure_ta_path_planning_node() first."
+                ),
+                "logs": logs,
+            }
+
+        # 2. Call /straight
+        straight_cmd = f'ros2 service call {straight_service} std_srvs/srv/Empty "{{}}"'
+        straight_res = _run_ros_shell(straight_cmd, timeout=service_timeout)
+
+        logs["straight"] = {
+            "returncode": straight_res.returncode,
+            "stdout": straight_res.stdout,
+            "stderr": straight_res.stderr,
+            "cmd": straight_cmd,
+        }
+
+        if straight_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "straight",
+                "error": "Straight path service failed.",
+                "logs": logs,
+            }
+
+        # 3. Wait
+        time.sleep(straight_to_interpolation_wait_sec)
+
+        # 4. Call /interpolation
+        interp_cmd = f'ros2 service call {interpolation_service} std_srvs/srv/Empty "{{}}"'
+        interp_res = _run_ros_shell(interp_cmd, timeout=service_timeout)
+
+        logs["interpolation"] = {
+            "returncode": interp_res.returncode,
+            "stdout": interp_res.stdout,
+            "stderr": interp_res.stderr,
+            "cmd": interp_cmd,
+        }
+
+        if interp_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "interpolation",
+                "error": "Interpolation service failed.",
+                "logs": logs,
+            }
+
+        return {
+            "success": True,
+            "logs": logs,
+            "stdout": (
+                "TA straight/interpolation completed.\n"
+                f"straight_service: {straight_service}\n"
+                f"interpolation_service: {interpolation_service}\n"
+                "waypoint extraction: skipped\n"
+                "polishing execution: skipped"
+            ),
+            "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired: {str(e)}",
+            "logs": logs,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": logs,
+        }
+
+@mcp.tool()
+def move_robot_to_initial_pose(
+    request: str = "move robot to initial pose",
+    home_pose: Optional[List[float]] = None,
+    service_name: str = "/singleArm_cmd/single_arm_command",
+    service_type: str = "y2_rob_motion_interfaces/srv/SingleArmCommand",
+    service_wait_timeout: int = 30,
+    service_call_timeout: int = 120,
+) -> dict:
+    """
+    Move the robot arm to the predefined initial/home pose using PTP.
+
+    Use this tool when the user says:
+    - 초기위치로 돌아가
+    - 초기 위치로 보내줘
+    - 로봇팔 원위치로 보내줘
+    - 홈 포즈로 이동해줘
+    - 시작 자세로 돌아가줘
+    - 안전 위치로 이동해줘
+    - go home
+    - move to home pose
+    - return to initial position
+    - move robot to initial pose
+
+    This tool calls:
+      /singleArm_cmd/single_arm_command
+
+    with:
+      command_mode: 'PTP'
+      target_pose: [x, y, z, rx, ry, rz]
+      load_file: ''
+    """
+
+    logs = {}
+
+    try:
+        # ------------------------------------------------------------
+        # 1. Default home pose
+        #    TODO: 반드시 네 시스템의 실제 안전 초기 TCP pose로 수정할 것.
+        # ------------------------------------------------------------
+        if home_pose is None:
+            home_pose = [
+                800,   # x [mm]
+                380,   # y [mm]
+                180,   # z [mm]
+                0.0, # rx [rad]
+                0.0,     # ry [rad]
+                1.57,     # rz [rad]
+            ]
+
+        # ------------------------------------------------------------
+        # 2. Validate target pose
+        # ------------------------------------------------------------
+        if len(home_pose) != 6:
+            return {
+                "success": False,
+                "stage": "home_pose_check",
+                "error": (
+                    "home_pose must contain exactly 6 values: "
+                    "[x, y, z, rx, ry, rz]."
+                ),
+                "home_pose": home_pose,
+            }
+
+        # ------------------------------------------------------------
+        # 3. Check SingleArmCommand service
+        # ------------------------------------------------------------
+        service_check = _wait_for_ros_service(
+            service_name=service_name,
+            timeout_sec=service_wait_timeout,
+        )
+
+        logs["service_check"] = service_check
+
+        if not service_check["available"]:
+            return {
+                "success": False,
+                "stage": "service_check",
+                "error": (
+                    f"Service {service_name} was not available within "
+                    f"{service_wait_timeout} seconds. "
+                    "Run prepare_polishing_system first."
+                ),
+                "logs": logs,
+            }
+
+        # ------------------------------------------------------------
+        # 4. Build PTP service request
+        # ------------------------------------------------------------
+        pose_yaml = "[" + ", ".join(str(float(v)) for v in home_pose) + "]"
+
+        request_yaml = (
+            "{"
+            "command_mode: 'PTP', "
+            f"target_pose: {pose_yaml}, "
+            "load_file: ''"
+            "}"
+        )
+
+        service_cmd = (
+            f"ros2 service call {service_name} {service_type} "
+            f"\"{request_yaml}\""
+        )
+
+        service_res = _run_ros_shell(
+            service_cmd,
+            timeout=service_call_timeout,
+        )
+
+        logs["service_call"] = {
+            "returncode": service_res.returncode,
+            "stdout": service_res.stdout,
+            "stderr": service_res.stderr,
+            "cmd": service_cmd,
+            "request": {
+                "command_mode": "PTP",
+                "target_pose": home_pose,
+                "load_file": "",
+            },
+        }
+
+        if service_res.returncode != 0:
+            return {
+                "success": False,
+                "stage": "service_call",
+                "error": "Initial pose PTP service call failed.",
+                "logs": logs,
+            }
+
+        return {
+            "success": True,
+            "request": request,
+            "home_pose": home_pose,
+            "service_name": service_name,
+            "logs": logs,
+            "stdout": (
+                "Robot arm was commanded to move to the initial/home pose.\n"
+                f"home_pose: {home_pose}\n"
+                "command_mode: PTP"
+            ),
+            "stderr": "",
+        }
+
+    except subprocess.TimeoutExpired as e:
+        return {
+            "success": False,
+            "error": f"TimeoutExpired: {str(e)}",
+            "logs": logs,
         }
 
     except Exception as e:
